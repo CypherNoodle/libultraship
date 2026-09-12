@@ -144,6 +144,7 @@ class Fast3dGui : public Ship::Gui {
     void RefreshImGuiGamepads() override;
 
   protected:
+    float ComputeDpiScale() override;
     void ImGuiWMInit() override;
     void ImGuiWMShutdown() override;
     void ImGuiBackendInit() override;
