@@ -650,6 +650,7 @@ void Interpreter::SetResolvedResourceCacheEnabled(bool enabled) {
     mResolvedResourceCacheEnabled = enabled;
     if (!enabled) {
         mResolvedResourceCache.clear();
+        mDrawTextureCache.clear();
     }
 }
 
@@ -759,6 +760,7 @@ void Interpreter::TextureCacheClear() {
     mTextureCache.map.clear();
     mTextureCache.lru.clear();
     mResolvedResourceCache.clear();
+    mDrawTextureCache.clear();
     // Drop async texture futures too — they hold shared_ptrs to resources that an
     // alt-asset toggle (which calls gfx_texture_cache_clear) has just invalidated.
     mTexFutures.clear();
@@ -776,6 +778,35 @@ void Interpreter::ShaderCacheClear() {
 
 std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* name) {
     auto rm = Ship::Context::GetRawInstance()->GetResourceManager();
+    const bool altEnabled = rm->IsAltAssetsEnabled();
+
+    // Alt assets decide every resolution below, so a runtime toggle drops what was
+    // remembered here (and the settled async decisions along with it).
+    if (mDrawTextureCacheAltAssets != (int8_t)altEnabled) {
+        mDrawTextureCache.clear();
+        mTexFutures.clear();
+        mTexSwappedIn.clear();
+        mDrawTextureCacheAltAssets = (int8_t)altEnabled;
+    }
+
+    // Texture binds ask for the same paths every frame, and the answer only changes when
+    // an async load settles or alt assets are toggled. Memoize the settled resource per
+    // path pointer (the opt-in contract of ResolveResourceCached) so the steady state
+    // skips the string building and the resource manager's hash and mutex work.
+    if (mResolvedResourceCacheEnabled) {
+        auto it = mDrawTextureCache.find(name);
+        if (it != mDrawTextureCache.end()) {
+            return it->second;
+        }
+    }
+
+    // Remember a resolution that cannot change again until one of the events above.
+    auto settled = [this, name](std::shared_ptr<Ship::IResource> res) {
+        if (mResolvedResourceCacheEnabled && res != nullptr) {
+            mDrawTextureCache[name] = res;
+        }
+        return res;
+    };
 
     // Resolve vanilla vs HD by EXPLICIT path (loadExact) rather than the ResourceManager's
     // internal alt resolution. This means vanilla ("name") and HD ("alt/name") live under
@@ -786,8 +817,8 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
     const bool alreadyAlt = nameStr.rfind(Ship::IResource::gAltAssetPrefix, 0) == 0;
 
     // Vanilla: load the exact base path, no HD.
-    if (!rm->IsAltAssetsEnabled() || alreadyAlt) {
-        return rm->LoadResource(name, /*loadExact=*/true);
+    if (!altEnabled || alreadyAlt) {
+        return settled(rm->LoadResource(name, /*loadExact=*/true));
     }
 
     const std::string altName = Ship::IResource::gAltAssetPrefix + nameStr;
@@ -795,25 +826,25 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
     // Synchronous (async loading off): try the HD path, fall back to vanilla when absent.
     if (!mAsyncTextureLoad) {
         if (auto hd = rm->LoadResource(altName, /*loadExact=*/true)) {
-            return hd;
+            return settled(hd);
         }
-        return rm->LoadResource(name, /*loadExact=*/true);
+        return settled(rm->LoadResource(name, /*loadExact=*/true));
     }
 
     // Already resolved on an earlier frame: keep using that result (HD if it exists, else
     // vanilla) unconditionally, so it never flickers back under budget pressure.
-    if (mTexSwappedIn.count(name)) {
-        auto& f = mTexFutures[name];
+    if (mTexSwappedIn.count(nameStr)) {
+        auto& f = mTexFutures[nameStr];
         if (f.valid() && f.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
             if (auto r = f.get()) {
-                return r;
+                return settled(r);
             }
         }
-        return rm->LoadResource(name, /*loadExact=*/true);
+        return settled(rm->LoadResource(name, /*loadExact=*/true));
     }
 
     // Async path: decode the HD ("alt/name") on the thread pool while vanilla renders.
-    auto& fut = mTexFutures[name];
+    auto& fut = mTexFutures[nameStr];
     if (!fut.valid()) {
         fut = rm->LoadResourceAsync(altName, /*loadExact=*/true);
     }
@@ -821,19 +852,19 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
         if (auto res = fut.get()) {
             // HD decoded. Its first draw triggers the (large) GPU upload — budget that swap-in
             // so a whole level's HD textures don't all upload the same frame. Over budget →
-            // keep showing vanilla and try again next frame.
+            // keep showing vanilla and try again next frame (so this one is not remembered).
             if (mReplacementUploadBudget > 0 && mFrameReplacementUploads >= mReplacementUploadBudget) {
                 return rm->LoadResource(name, /*loadExact=*/true);
             }
             mFrameReplacementUploads++;
-            mTexSwappedIn.insert(name);
-            return res;
+            mTexSwappedIn.insert(nameStr);
+            return settled(res);
         }
         // No HD for this texture — settle on vanilla and stop re-checking.
-        mTexSwappedIn.insert(name);
-        return rm->LoadResource(name, /*loadExact=*/true);
+        mTexSwappedIn.insert(nameStr);
+        return settled(rm->LoadResource(name, /*loadExact=*/true));
     }
-    // Still decoding — render the cheap vanilla version this frame.
+    // Still decoding — render the cheap vanilla version this frame, and do not remember it.
     return rm->LoadResource(name, /*loadExact=*/true);
 }
 

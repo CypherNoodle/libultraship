@@ -635,6 +635,11 @@ class Interpreter {
     GfxTextureCache mTextureCache{};
     std::unordered_map<const void*, std::shared_ptr<Ship::IResource>> mResolvedResourceCache;
     bool mResolvedResourceCacheEnabled = false;
+    // Same memoization, for the alt-aware texture path (AcquireDrawTexture): the settled
+    // resource per path pointer. Alt assets decide what "settled" means, so the map is
+    // dropped whenever that setting changes. -1 = no resolution cached yet.
+    std::unordered_map<const void*, std::shared_ptr<Ship::IResource>> mDrawTextureCache;
+    int8_t mDrawTextureCacheAltAssets = -1;
     // Extra mip levels (beyond the base) for the texture import in progress.
     // Set around ImportTexture calls in GfxSpTri1; 0 everywhere else.
     uint8_t mCurrentMipExtraLevels{};
