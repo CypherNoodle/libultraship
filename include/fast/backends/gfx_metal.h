@@ -48,7 +48,7 @@ static size_t cantor(uint64_t a, uint64_t b) {
 }
 
 struct hash_pair_shader_ids {
-    size_t operator()(const std::pair<uint64_t, uint32_t>& p) const {
+    size_t operator()(const std::pair<uint64_t, uint64_t>& p) const {
         auto value1 = p.first;
         auto value2 = p.second;
         return cantor(value1, value2);
@@ -64,6 +64,8 @@ struct ShaderProgramMetal {
     uint8_t numInputs;
     uint8_t numFloats;
     bool usedTextures[SHADER_MAX_TEXTURES];
+    // Vertex shader consumes the LightUniforms buffer (lighting and/or texgen)
+    bool usedLighting = false;
     bool markedForDeletion = false;
 
     // hashed by msaa_level
@@ -77,6 +79,8 @@ struct TextureDataMetal {
     uint32_t width;
     uint32_t height;
     uint32_t filtering;
+    // Total mip levels uploaded (0/1 = base level only)
+    uint32_t mip_levels;
     bool linear_filtering;
 };
 
@@ -121,6 +125,15 @@ struct FrameUniforms {
 struct DrawUniforms {
     simd::int1 textureFiltering[SHADER_MAX_TEXTURES];
     simd::float1 prim_depth;
+    simd::float1 lod_max;
+    simd::float4 inputs[6];
+    simd::float4 fog_color;
+    simd::float4 grayscale_color;
+    simd::float4 uv_transform[2];
+    simd::float4 texture_clamp[2];
+    simd::float4 fog_params;
+    simd::float4 palette_params[2];
+    simd::float4 lod_params;
 };
 
 struct CoordUniforms {
@@ -142,9 +155,12 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     uint32_t NewTexture() override;
     void SelectTexture(int tile, uint32_t textureId) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
+    void UploadTextureMip(const uint8_t* rgba32Buf, uint32_t width, uint32_t height, uint32_t level,
+                          uint32_t totalLevels) override;
     void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) override;
     void SetDepthTestAndMask(bool depth_test, bool z_upd) override;
     void SetCurrentPrimDepth(float depth) override;
+    void SetCurrentMaxLod(float maxLod) override;
     void SetZmodeDecal(bool decal) override;
     void SetStrictDecal(bool on) override;
     void SetViewport(int x, int y, int width, int height) override;
@@ -193,7 +209,7 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
 
     int mCurrentVertexBufferPoolIndex = 0;
     MTL::Buffer* mVertexBufferPool[kMaxVertexBufferPoolSize];
-    std::unordered_map<std::pair<uint64_t, uint32_t>, struct ShaderProgramMetal, hash_pair_shader_ids>
+    std::unordered_map<std::pair<uint64_t, uint64_t>, struct ShaderProgramMetal, hash_pair_shader_ids>
         mShaderProgramPool;
 
     std::vector<struct TextureDataMetal> mTextures;
@@ -236,6 +252,7 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     int mCurrentFramebuffer;
     size_t mCurrentVertexBufferOffset;
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
+    bool mLodMaxDirty = true;
 
     bool mNonUniformThreadgroupSupported;
 };
