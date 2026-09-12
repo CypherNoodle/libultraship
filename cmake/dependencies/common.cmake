@@ -29,9 +29,12 @@ target_sources(ImGui
 
 target_sources(ImGui
     PRIVATE
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
 )
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    target_sources(ImGui PRIVATE ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
+endif()
 
 target_include_directories(ImGui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends PRIVATE ${SDL2_INCLUDE_DIRS})
 
@@ -91,25 +94,42 @@ if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "And
             endif()
         else()
             if(DEFINED ENV{VULKAN_SDK})
+                find_library(Vulkan_shaderc_shared_LIBRARY NAMES shaderc_shared HINTS "$ENV{VULKAN_SDK}/lib" "$ENV{VULKAN_SDK}/lib64" NO_DEFAULT_PATH)
                 find_library(Vulkan_shaderc_combined_LIBRARY NAMES shaderc_combined HINTS "$ENV{VULKAN_SDK}/lib" "$ENV{VULKAN_SDK}/lib64" NO_DEFAULT_PATH)
                 find_library(Vulkan_shaderc_combined_DEBUG_LIBRARY NAMES shaderc_combinedd HINTS "$ENV{VULKAN_SDK}/lib" "$ENV{VULKAN_SDK}/lib64" NO_DEFAULT_PATH)
             else()
+                find_library(Vulkan_shaderc_shared_LIBRARY NAMES shaderc_shared)
                 find_library(Vulkan_shaderc_combined_LIBRARY NAMES shaderc_combined)
                 find_library(Vulkan_shaderc_combined_DEBUG_LIBRARY NAMES shaderc_combinedd)
             endif()
 
-            if(Vulkan_shaderc_combined_LIBRARY)
+            if(Vulkan_shaderc_shared_LIBRARY)
+                if(NOT TARGET Vulkan::shaderc_shared)
+                    add_library(Vulkan::shaderc_shared SHARED IMPORTED GLOBAL)
+                    set_target_properties(Vulkan::shaderc_shared PROPERTIES
+                        IMPORTED_LOCATION "${Vulkan_shaderc_shared_LIBRARY}")
+                endif()
+                message(STATUS "Vulkan rendering backend enabled (shaderc_shared)")
+            elseif(Vulkan_shaderc_combined_LIBRARY)
                 if(NOT TARGET Vulkan::shaderc_combined)
-                    add_library(Vulkan::shaderc_combined STATIC IMPORTED GLOBAL)
-                    set_target_properties(Vulkan::shaderc_combined PROPERTIES
-                        IMPORTED_LOCATION "${Vulkan_shaderc_combined_LIBRARY}")
-                    if(Vulkan_shaderc_combined_DEBUG_LIBRARY)
-                        set_property(TARGET Vulkan::shaderc_combined APPEND PROPERTY IMPORTED_CONFIGURATIONS DEBUG)
-                        set_target_properties(Vulkan::shaderc_combined PROPERTIES
-                            IMPORTED_LOCATION_DEBUG "${Vulkan_shaderc_combined_DEBUG_LIBRARY}")
+                    foreach(_lib glslang MachineIndependent GenericCodeGen OSDependent OGLCompiler
+                                 SPVRemapper HLSL SPIRV SPIRV-Tools-opt SPIRV-Tools SPIRV-Tools-link)
+                        find_library(_lus_shaderc_dep_${_lib} NAMES ${_lib})
+                        if(_lus_shaderc_dep_${_lib})
+                            list(APPEND _lus_shaderc_deps "${_lus_shaderc_dep_${_lib}}")
+                        endif()
+                    endforeach()
+
+                    add_library(Vulkan::shaderc_combined INTERFACE IMPORTED GLOBAL)
+                    if(_lus_shaderc_deps AND NOT APPLE)
+                        set_property(TARGET Vulkan::shaderc_combined PROPERTY INTERFACE_LINK_LIBRARIES
+                            -Wl,--start-group "${Vulkan_shaderc_combined_LIBRARY}" ${_lus_shaderc_deps} -Wl,--end-group)
+                    else()
+                        set_property(TARGET Vulkan::shaderc_combined PROPERTY INTERFACE_LINK_LIBRARIES
+                            "${Vulkan_shaderc_combined_LIBRARY}" ${_lus_shaderc_deps})
                     endif()
                 endif()
-                message(STATUS "Vulkan rendering backend enabled (shaderc_combined)")
+                message(STATUS "Vulkan rendering backend enabled (shaderc_combined + glslang/SPIRV-Tools)")
             else()
                 message(STATUS "Vulkan rendering backend enabled (shaderc not found, shader compilation unavailable)")
             endif()
@@ -393,9 +413,10 @@ if(NOT TARGET libtcc)
             BUILD_RPATH "$<TARGET_FILE_DIR:libtcc>"
         )
 
+        find_program(GNU_MAKE_PROGRAM NAMES make gmake REQUIRED)
         add_custom_command(
             OUTPUT "${tinycc_SOURCE_DIR}/libtcc1.a"
-            COMMAND ${CMAKE_MAKE_PROGRAM} -C "${tinycc_SOURCE_DIR}/lib"
+            COMMAND ${GNU_MAKE_PROGRAM} -C "${tinycc_SOURCE_DIR}/lib"
             DEPENDS
                 tcc_native_bin
                 libtcc
