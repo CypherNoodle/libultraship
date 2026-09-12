@@ -787,8 +787,8 @@ class Interpreter {
     // 0 = previous tick, 1 = current tick. Set by the port before each
     // DrawAndRunGraphicsCommands call, like mInterpolationIndex.
     float mInterpolationT = 1.0f;
-    int mInterpolationTotal;
-    float mInterpolationFrac;
+    int mInterpolationTotal{};
+    float mInterpolationFrac{};
     // N64 RGB framebuffer dither (G_CD_*), applied per-draw in the fragment shader.
     // Cached once per frame from the gEnhancements.Graphics.DitherNoise CVar.
     bool mRgbDitherEnabled = true;
