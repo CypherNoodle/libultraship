@@ -21,6 +21,8 @@ struct DrawUniforms {
     float4 fog_params;
     float4 palette_params[2];
     float4 lod_params;
+    // Game-bindable register file; lockstep with DrawUniforms in gfx_metal.h
+    float4 uCustom[32];
 };
 
 @if(o_lighting || o_texgen)
@@ -257,6 +259,35 @@ float random(float3 value) {
     return fract(sin(random) * 143758.5453);
 }
 
+// N64 RDP ordered-dither matrices (values 0..7) added to the 8-bit color before
+// truncation to 5 bits, recreating the RGBA5551 framebuffer grain.
+constant int kDitherMagic[16] = { 0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0 };
+constant int kDitherBayer[16] = { 0, 4, 1, 5, 6, 2, 7, 3, 1, 5, 0, 4, 7, 3, 6, 2 };
+
+// Applies the RDP's RGB dither + 5-bit quantization, matching the per-primitive
+// G_CD_* mode. mode: 0=magic square, 1=bayer, 2=noise (temporal), 3=disable
+// (truncate only), >=4 = feature off (full precision passthrough). Dither cells are
+// scaled to native resolution via noiseScale so the grain looks hardware-accurate.
+float3 applyRdpDither(float3 color, float modeF, float2 fragCoord, float noiseScale, int frameCount) {
+    int mode = int(modeF + 0.5);
+    if (mode >= 4) {
+        return color;
+    }
+    float2 nativeCoord = floor(fragCoord * noiseScale);
+    float d = 0.0;
+    if (mode == 0) {
+        int2 cell = int2(nativeCoord) & 3;
+        d = float(kDitherMagic[cell.y * 4 + cell.x]);
+    } else if (mode == 1) {
+        int2 cell = int2(nativeCoord) & 3;
+        d = float(kDitherBayer[cell.y * 4 + cell.x]);
+    } else if (mode == 2) {
+        d = floor(random(float3(nativeCoord, float(frameCount))) * 8.0);
+    }
+    float3 q = min(floor(clamp(color * 255.0 + d, 0.0, 255.0) / 8.0), 31.0);
+    return (q * 8.0 + floor(q / 4.0)) / 255.0;
+}
+
 @if(o_palette[0] || o_palette[1])
 // One CI tap: fetch the index (nearest sampler) and look it up in the
 // 256-entry palette texture. bank is the CI4 bank entry offset.
@@ -372,6 +403,13 @@ fragment FragOut fragmentShader(
                     }
                     float lodTile0 = clamp(lodTileBase, 0.0, drawUniforms.lod_max);
                     float lodTile1 = clamp(lodTileBase + 1.0, 0.0, drawUniforms.lod_max);
+                    // No real LOD level beyond the base (max level 0): the N64 never
+                    // blends a second tile. Small EXTRA_TILE_MIPMAPS textures
+                    // degenerate to one level yet still emit G_TL_LOD+TRILERP; without
+                    // this the combiner blends a stale TEXEL1 by distance.
+                    if (drawUniforms.lod_max < 0.5) {
+                        lodFrac = 0.0;
+                    }
                 @end
             @end
 
@@ -484,6 +522,13 @@ fragment FragOut fragmentShader(
     @if(o_alpha && o_noise)
         float2 coords = in.position.xy * frameUniforms.noiseScale;
         texel.w *= round(saturate(random(float3(floor(coords), float(frameUniforms.frameCount))) + texel.w - 0.5));
+    @end
+
+    // N64 RGB framebuffer dither (per-primitive G_CD_* mode in lod_params.w)
+    @if(o_alpha)
+        texel.xyz = applyRdpDither(texel.xyz, drawUniforms.lod_params.w, in.position.xy, frameUniforms.noiseScale, frameUniforms.frameCount);
+    @else
+        texel = applyRdpDither(texel, drawUniforms.lod_params.w, in.position.xy, frameUniforms.noiseScale, frameUniforms.frameCount);
     @end
 
     FragOut out;

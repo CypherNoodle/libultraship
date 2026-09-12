@@ -407,7 +407,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     size_t len, numFloats;
 
     auto shader = gfx_direct3d_common_build_shader(numFloats, cc_features, false,
-                                                   mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
+                                                   mCurrentFilterMode == FILTER_THREE_POINT);
 
     buf = shader.data();
     len = shader.size();
@@ -809,7 +809,7 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
     }
 
     // Set per-draw constant buffer (texture metadata + combiner constants)
-    if (textures_changed || mCombinerUniformsDirty) {
+    if (textures_changed || mCombinerUniformsDirty || mCustomUniformsDirty) {
         memcpy(mPerDrawCbData.combiner_inputs, mCombinerUniforms.inputs, sizeof(mPerDrawCbData.combiner_inputs));
         memcpy(mPerDrawCbData.fog_color, mCombinerUniforms.fog_color, sizeof(mPerDrawCbData.fog_color));
         memcpy(mPerDrawCbData.grayscale_color, mCombinerUniforms.grayscale_color,
@@ -817,15 +817,16 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         memcpy(mPerDrawCbData.uv_transform, mCombinerUniforms.uv_transform, sizeof(mPerDrawCbData.uv_transform));
         memcpy(mPerDrawCbData.texture_clamp, mCombinerUniforms.texture_clamp, sizeof(mPerDrawCbData.texture_clamp));
         memcpy(mPerDrawCbData.fog_params, mCombinerUniforms.fog_params, sizeof(mPerDrawCbData.fog_params));
-        memcpy(mPerDrawCbData.palette_params, mCombinerUniforms.palette_params,
-               sizeof(mPerDrawCbData.palette_params));
+        memcpy(mPerDrawCbData.palette_params, mCombinerUniforms.palette_params, sizeof(mPerDrawCbData.palette_params));
         memcpy(mPerDrawCbData.lod_params, mCombinerUniforms.lod_params, sizeof(mPerDrawCbData.lod_params));
+        memcpy(mPerDrawCbData.uCustom, mCustomUniforms.regs, sizeof(mPerDrawCbData.uCustom));
         D3D11_MAPPED_SUBRESOURCE ms;
         ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
         mContext->Map(mPerDrawCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
         memcpy(ms.pData, &mPerDrawCbData, sizeof(PerDrawCB));
         mContext->Unmap(mPerDrawCb.Get(), 0);
         mCombinerUniformsDirty = false;
+        mCustomUniformsDirty = false;
     }
 
     // Lighting/texgen uniforms for the vertex shader
@@ -1326,9 +1327,6 @@ ImTextureID GfxRenderingAPIDX11::GetTextureById(int id) {
     return mTextures[id].resource_view.Get();
 }
 
-void GfxRenderingAPIDX11::SetSrgbMode() {
-    mSrgbMode = true;
-}
 
 #define RAND_NOISE "((random(float3(floor(screenSpace.xy * noise_scale), noise_frame)) + 1.0) / 2.0)"
 
@@ -1490,7 +1488,7 @@ std::optional<std::string> dx_include_fs(const std::string& path) {
     init->ByteOrder = Ship::Endianness::Native;
     init->Format = RESOURCE_FORMAT_BINARY;
     auto res = static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, true, init));
+        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, false, init));
     if (res == nullptr) {
         return std::nullopt;
     }
@@ -1500,11 +1498,16 @@ std::optional<std::string> dx_include_fs(const std::string& path) {
 }
 
 std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures& cc_features,
-                                             bool include_root_signature, bool three_point_filtering, bool use_srgb) {
+                                             bool include_root_signature, bool three_point_filtering) {
     raw_numFloats = 4;
 
     prism::Processor processor;
     prism::ContextItems mContext = {
+        { "BACKEND", "directx" },
+        { "BACKEND_OPENGL", false },
+        { "BACKEND_VULKAN", false },
+        { "BACKEND_METAL", false },
+        { "BACKEND_DIRECTX", true },
         { "SHADER_0", SHADER_0 },
         { "SHADER_INPUT_1", SHADER_INPUT_1 },
         { "SHADER_INPUT_2", SHADER_INPUT_2 },
@@ -1552,10 +1555,13 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_color_alpha_same", M_ARRAY(cc_features.color_alpha_same, bool, 2) },
         { "o_root_signature", include_root_signature },
         { "o_three_point_filtering", three_point_filtering },
-        { "srgb_mode", use_srgb },
         { "append_formula", (InvokeFunc)prism_append_formula },
         { "update_floats", (InvokeFunc)update_raw_floats },
     };
+    // Inject current values for @setting-declared tweakables (compile-time)
+    for (const auto& [var, value] : Fast::gfx_get_shader_setting_values(cc_features.shader_id)) {
+        mContext[var] = value;
+    }
     processor.populate(mContext);
     auto init = std::make_shared<Ship::ResourceInitData>();
     init->Type = (uint32_t)Ship::ResourceType::Shader;
@@ -1569,10 +1575,10 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
     }
 
     auto res = static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, true, init));
+        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, false, init));
 
     if (res == nullptr) {
-        SPDLOG_ERROR("Failed to load default directx shader, missing f3d.o2r?");
+        SPDLOG_ERROR("Failed to load directx shader '{}', missing f3d.o2r?", path);
         abort();
     }
 
@@ -1580,6 +1586,7 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
     processor.load(*shader);
     processor.bind_include_loader(dx_include_fs);
     auto result = processor.process();
+    Fast::gfx_register_shader_settings(cc_features.shader_id, processor.settings());
     numFloats = raw_numFloats;
     // SPDLOG_INFO("=========== DX11 SHADER ============");
     // SPDLOG_INFO(result);

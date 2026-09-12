@@ -134,6 +134,8 @@ struct DrawUniforms {
     simd::float4 fog_params;
     simd::float4 palette_params[2];
     simd::float4 lod_params;
+    // Game-bindable register file; lockstep with the metal template's DrawUniforms
+    simd::float4 uCustom[GFX_NUM_CUSTOM_UNIFORMS];
 };
 
 struct CoordUniforms {
@@ -189,7 +191,6 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void DeleteTexture(uint32_t texId) override;
     void SetTextureFilter(FilteringMode mode) override;
     FilteringMode GetTextureFilter() override;
-    void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
 
     void NewFrame();

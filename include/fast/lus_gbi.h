@@ -78,6 +78,8 @@ constexpr int8_t RDP_G_TRI1_WIDE = OPCODE(0x49);
 constexpr int8_t RDP_G_SETTILESIZE_LERP = OPCODE(0x4a);
 constexpr int8_t OTR_G_INVAL_TEX_BY_PAL = OPCODE(0x2a);
 constexpr int8_t OTR_G_SET_STRICT_DECAL = OPCODE(0x4b);
+constexpr int8_t OTR_G_SETUNIFORM = OPCODE(0x4c);
+constexpr int8_t RDP_G_SETTILESCROLL_INTERP = OPCODE(0x4d);
 
 /*
  * The following commands are the "generated" RDP commands; the user

@@ -91,6 +91,9 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
     if (mCurrentShaderProgram->lod_params_location >= 0) {
         glUniform4fv(mCurrentShaderProgram->lod_params_location, 1, mCombinerUniforms.lod_params);
     }
+    if (mCurrentShaderProgram->custom_location >= 0) {
+        glUniform4fv(mCurrentShaderProgram->custom_location, GFX_NUM_CUSTOM_UNIFORMS, &mCustomUniforms.regs[0][0]);
+    }
 
     // Vertex transform: matrix palette + y flip
     if (mCurrentShaderProgram->mtx_palette_location >= 0) {
@@ -308,7 +311,7 @@ std::optional<std::string> opengl_include_fs(const std::string& path) {
     init->ByteOrder = Ship::Endianness::Native;
     init->Format = RESOURCE_FORMAT_BINARY;
     auto res = std::static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, true, init));
+        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, false, init));
     if (res == nullptr) {
         return std::nullopt;
     }
@@ -319,6 +322,11 @@ std::optional<std::string> opengl_include_fs(const std::string& path) {
 std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
     prism::Processor processor;
     prism::ContextItems mContext = {
+        { "BACKEND", "opengl" },
+        { "BACKEND_OPENGL", true },
+        { "BACKEND_VULKAN", false },
+        { "BACKEND_METAL", false },
+        { "BACKEND_DIRECTX", false },
         { "VERTEX_SHADER", false },
         { "o_c", M_ARRAY(cc_features.c, int, 2, 2, 4) },
         { "o_alpha", cc_features.opt_alpha },
@@ -350,7 +358,6 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "FILTER_THREE_POINT", FILTER_THREE_POINT },
         { "FILTER_LINEAR", FILTER_LINEAR },
         { "FILTER_NONE", FILTER_NONE },
-        { "srgb_mode", mSrgbMode },
         { "SHADER_0", SHADER_0 },
         { "SHADER_INPUT_1", SHADER_INPUT_1 },
         { "SHADER_INPUT_2", SHADER_INPUT_2 },
@@ -391,6 +398,10 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "vOutColor", "gl_FragColor" },
 #endif
     };
+    // Inject current values for @setting-declared tweakables (compile-time)
+    for (const auto& [var, value] : Fast::gfx_get_shader_setting_values(cc_features.shader_id)) {
+        mContext[var] = value;
+    }
     processor.populate(mContext);
     auto init = std::make_shared<Ship::ResourceInitData>();
     init->Type = (uint32_t)Ship::ResourceType::Shader;
@@ -404,7 +415,7 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
     }
 
     auto res = static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, true, init));
+        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, false, init));
 
     if (res == nullptr) {
         SPDLOG_ERROR("Failed to load default fragment shader, missing f3d.o2r?");
@@ -415,6 +426,7 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
     processor.load(*shader);
     processor.bind_include_loader(opengl_include_fs);
     auto result = processor.process();
+    Fast::gfx_register_shader_settings(cc_features.shader_id, processor.settings());
     // SPDLOG_INFO("=========== FRAGMENT SHADER ============");
     // SPDLOG_INFO(result);
     // SPDLOG_INFO("========================================");
@@ -431,7 +443,12 @@ static prism::ContextTypes* UpdateFloats(prism::ContextTypes* _, prism::ContextT
 static std::string BuildVsShader(const CCFeatures& cc_features) {
     numFloats = 4;
     prism::Processor processor;
-    prism::ContextItems mContext = { { "VERTEX_SHADER", true },
+    prism::ContextItems mContext = { { "BACKEND", "opengl" },
+                                     { "BACKEND_OPENGL", true },
+                                     { "BACKEND_VULKAN", false },
+                                     { "BACKEND_METAL", false },
+                                     { "BACKEND_DIRECTX", false },
+                                     { "VERTEX_SHADER", true },
                                      { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
                                      { "o_clamp", M_ARRAY(cc_features.clamp, bool, 2, 2) },
                                      { "o_fog", cc_features.opt_fog },
@@ -462,6 +479,10 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
                                      { "opengles", false }
 #endif
     };
+    // Inject current values for @setting-declared tweakables (compile-time)
+    for (const auto& [var, value] : Fast::gfx_get_shader_setting_values(cc_features.shader_id)) {
+        mContext[var] = value;
+    }
     processor.populate(mContext);
 
     auto init = std::make_shared<Ship::ResourceInitData>();
@@ -476,7 +497,7 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
     }
 
     auto res = static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, true, init));
+        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, false, init));
 
     if (res == nullptr) {
         SPDLOG_ERROR("Failed to load default vertex shader, missing f3d.o2r?");
@@ -487,6 +508,7 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
     processor.load(*shader);
     processor.bind_include_loader(opengl_include_fs);
     auto result = processor.process();
+    Fast::gfx_register_shader_settings(cc_features.shader_id, processor.settings());
     // SPDLOG_INFO("=========== VERTEX SHADER ============");
     // SPDLOG_INFO(result);
     // SPDLOG_INFO("========================================");
@@ -538,6 +560,17 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     glAttachShader(shader_program, vertex_shader);
     glAttachShader(shader_program, fragment_shader);
     glLinkProgram(shader_program);
+
+    glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
+    if (!success) {
+        GLint max_length = 0;
+        glGetProgramiv(shader_program, GL_INFO_LOG_LENGTH, &max_length);
+        std::string error_log(max_length > 0 ? (size_t)max_length : (size_t)1, '\0');
+        glGetProgramInfoLog(shader_program, max_length, &max_length, error_log.data());
+        SPDLOG_ERROR("Shader program link failed (shader_id0={:#x}, shader_id1={:#x}): {}", shader_id0, shader_id1,
+                     error_log.c_str());
+        abort();
+    }
 
     size_t cnt = 0;
 
@@ -607,6 +640,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->mv_cols_location = glGetUniformLocation(shader_program, "uMvCols");
     prg->palette_params_location = glGetUniformLocation(shader_program, "uPaletteParams");
     prg->lod_params_location = glGetUniformLocation(shader_program, "uLodParams");
+    prg->custom_location = glGetUniformLocation(shader_program, "uCustom");
 
     LoadShader(prg);
 
@@ -738,10 +772,9 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
     // Mip chains are sampled with explicit integer LODs (textureLod) in the shader;
     // MIPMAP_NEAREST picks the exact level while still filtering within it.
     const bool hasMips = textures[mCurrentTextureIds[tile]].mip_levels > 1;
-    const GLint minFilter =
-        hasMips ? (linear_filter && mCurrentFilterMode != FILTER_NONE ? GL_LINEAR_MIPMAP_NEAREST
-                                                                      : GL_NEAREST_MIPMAP_NEAREST)
-                : filter;
+    const GLint minFilter = hasMips ? (linear_filter && mCurrentFilterMode != FILTER_NONE ? GL_LINEAR_MIPMAP_NEAREST
+                                                                                          : GL_NEAREST_MIPMAP_NEAREST)
+                                    : filter;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
     textures[mCurrentTextureIds[tile]].filtering = !linear_filter ? FILTER_LINEAR : FILTER_THREE_POINT;
@@ -794,8 +827,7 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
     // to rasterizer winding via the VS y flip: signed area A = (yFlipped ? C : -C),
     // and GL's default front face is CCW (A > 0). keepSign > 0 keeps C > 0.
     const bool yFlipped = mTransformUniforms.y_scale[0] < 0.0f;
-    if (mCurrentCullKeepSign != mLastCullKeepSign ||
-        (mCurrentCullKeepSign != 0 && yFlipped != mLastCullYFlipped)) {
+    if (mCurrentCullKeepSign != mLastCullKeepSign || (mCurrentCullKeepSign != 0 && yFlipped != mLastCullYFlipped)) {
         mLastCullKeepSign = mCurrentCullKeepSign;
         mLastCullYFlipped = yFlipped;
         if (mCurrentCullKeepSign == 0) {
@@ -1256,10 +1288,6 @@ void GfxRenderingAPIOGL::SetTextureFilter(FilteringMode mode) {
 
 FilteringMode GfxRenderingAPIOGL::GetTextureFilter() {
     return mCurrentFilterMode;
-}
-
-void GfxRenderingAPIOGL::SetSrgbMode() {
-    mSrgbMode = true;
 }
 
 ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {

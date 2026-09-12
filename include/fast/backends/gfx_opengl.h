@@ -59,6 +59,7 @@ struct ShaderProgram {
     GLint mv_cols_location;
     GLint palette_params_location;
     GLint lod_params_location;
+    GLint custom_location;
 };
 
 struct FramebufferOGL {
@@ -127,7 +128,6 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void DeleteTexture(uint32_t texId) override;
     void SetTextureFilter(FilteringMode mode) override;
     FilteringMode GetTextureFilter() override;
-    void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
 
   private:

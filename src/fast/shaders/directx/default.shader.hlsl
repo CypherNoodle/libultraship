@@ -126,6 +126,32 @@ float random(in float3 value) {
     return frac(sin(random) * 143758.5453);
 }
 
+// N64 RDP ordered-dither matrices (values 0..7); see applyRdpDither.
+static const int kDitherMagic[16] = { 0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0 };
+static const int kDitherBayer[16] = { 0, 4, 1, 5, 6, 2, 7, 3, 1, 5, 0, 4, 7, 3, 6, 2 };
+
+// RDP RGB dither + RGBA5551 quantization. mode: 0=magic square, 1=bayer,
+// 2=noise (temporal), 3=disable (truncate only), >=4 = off (full precision).
+float3 applyRdpDither(float3 color, float modeF, float2 fragCoord, float noiseScale, float frameCount) {
+    int mode = int(modeF + 0.5);
+    if (mode >= 4) {
+        return color;
+    }
+    float2 nativeCoord = floor(fragCoord * noiseScale);
+    float d = 0.0;
+    if (mode == 0) {
+        int2 cell = int2(nativeCoord) & 3;
+        d = float(kDitherMagic[cell.y * 4 + cell.x]);
+    } else if (mode == 1) {
+        int2 cell = int2(nativeCoord) & 3;
+        d = float(kDitherBayer[cell.y * 4 + cell.x]);
+    } else if (mode == 2) {
+        d = floor(random(float3(nativeCoord, frameCount)) * 8.0);
+    }
+    float3 q = min(floor(clamp(color * 255.0 + d, 0.0, 255.0) / 8.0), 31.0);
+    return (q * 8.0 + floor(q / 4.0)) / 255.0;
+}
+
 // Per-draw constants: texture metadata for 3-point filtering plus the combiner
 // constant operands (prim, env, keys, K4/K5, fog/grayscale colors).
 // Layout must mirror struct PerDrawCB in gfx_direct3d_common.h.
@@ -143,6 +169,8 @@ cbuffer PerDrawCB : register(b1) {
     float4 fog_params;
     float4 palette_params[2];
     float4 lod_params; // x = res scale, y = prim_lod_min, z = G_TD mode
+    // Game-bindable register file; lockstep with PerDrawCB in gfx_direct3d_common.h
+    float4 uCustom[32];
 }
 
 // 3 point texture filtering
@@ -307,15 +335,6 @@ PSInput VSMain(
     [RootSignature(RS)]
 @end
 
-@if(srgb_mode)
-    float4 fromLinear(float4 linearRGB){
-        bool3 cutoff = linearRGB.rgb < float3(0.0031308, 0.0031308, 0.0031308);
-        float3 higher = 1.055 * pow(linearRGB.rgb, float3(1.0 / 2.4, 1.0 / 2.4, 1.0 / 2.4)) - float3(0.055, 0.055, 0.055);
-        float3 lower = linearRGB.rgb * float3(12.92, 12.92, 12.92);
-        return float4(lerp(higher, lower, cutoff), linearRGB.a);
-    }
-@end
-
 #define MOD(x, y) ((x) - (y) * floor((x)/(y)))
 #define WRAP(x, low, high) MOD((x)-(low), (high)-(low)) + (low)
 
@@ -381,6 +400,13 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
                     }
                     float lodTile0 = clamp(lodTileBase, 0.0, lod_max);
                     float lodTile1 = clamp(lodTileBase + 1.0, 0.0, lod_max);
+                    // No real LOD level beyond the base (max level 0): the N64 never
+                    // blends a second tile. Small EXTRA_TILE_MIPMAPS textures
+                    // degenerate to one level yet still emit G_TL_LOD+TRILERP; without
+                    // this the combiner blends a stale TEXEL1 by distance.
+                    if (lod_max < 0.5) {
+                        lodFrac = 0.0;
+                    }
                 @end
             @end
 
@@ -528,6 +554,13 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
         texel.a *= round(saturate(random(float3(floor(coords), noise_frame)) + texel.a - 0.5));
     @end
 
+    // N64 RGB framebuffer dither (per-primitive G_CD_* mode in lod_params.w)
+    @if(o_alpha)
+        texel.rgb = applyRdpDither(texel.rgb, lod_params.w, screenSpace.xy, noise_scale, noise_frame);
+    @else
+        texel = applyRdpDither(texel, lod_params.w, screenSpace.xy, noise_scale, noise_frame);
+    @end
+
     @if(o_alpha)
         @if(o_alpha_threshold)
             if (texel.a < 8.0 / 256.0) discard;
@@ -539,17 +572,9 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
 
     PSOutput output;
     @if(o_alpha)
-        @if(srgb_mode)
-            output.color = fromLinear(texel);
-        @else
-            output.color = texel;
-        @end
+        output.color = texel;
     @else
-        @if(srgb_mode)
-            output.color = fromLinear(float4(texel, 1.0));
-        @else
-            output.color = float4(texel, 1.0);
-        @end
+        output.color = float4(texel, 1.0);
     @end
     @if(o_prim_depth)
         output.depth = prim_depth;

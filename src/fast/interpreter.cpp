@@ -18,6 +18,7 @@
 #include <vector>
 #include <list>
 #include <stack>
+#include <chrono>
 #include "fast/resource/type/Light.h"
 
 #ifndef _LANGUAGE_C
@@ -34,9 +35,12 @@
 
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
+#include "ship/resource/archive/ArchiveManager.h"
 #include "ship/utils/Utils.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
+#include "ship/resource/factory/ShaderFactory.h"
+#include <nlohmann/json.hpp>
 
 #include "libultraship/libultra/os.h"
 
@@ -141,6 +145,7 @@ void Interpreter::Flush() {
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
         LatchCombinerUniforms();
         mRapi->SetTransformUniforms(mTransform);
+        mRapi->SetCustomUniforms(mCustomUniforms);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
@@ -181,9 +186,7 @@ uint8_t Interpreter::AppendMtxHistory(const float m[4][4], float aspectScale) {
 // passes them through unchanged.
 uint8_t Interpreter::GetIdentityMtxSlot() {
     if (!mMtxIdentityValid) {
-        static const float identity[4][4] = {
-            { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 }, { 0, 0, 0, 1 }
-        };
+        static const float identity[4][4] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 }, { 0, 0, 0, 1 } };
         mMtxIdentityEntry = AppendMtxHistory(identity, 1.0f);
         mMtxIdentityValid = true;
     }
@@ -1551,7 +1554,9 @@ static uint32_t TileHeightPx(const RDP* rdp, uint32_t tile) {
 // Detect a usable mip pyramid starting at baseTile. Returns the number of extra
 // levels beyond the base that can be decoded and uploaded (0 = no mipmapping).
 uint8_t Interpreter::DetectMipChain(uint32_t baseTile) const {
-    if ((mRdp->other_mode_l & G_TL_LOD) == 0) {
+    // G_TL_LOD lives in the HIGH othermode word (G_MDSFT_TEXTLOD == 16, set via
+    // G_SETOTHERMODE_H). Reading other_mode_l here would test a blender mux bit.
+    if ((mRdp->other_mode_h & G_TL_LOD) == 0) {
         return 0;
     }
     if ((mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) != G_CYC_2CYCLE) {
@@ -2072,6 +2077,7 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
     if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
+#ifndef GBI_FLOATS
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j++) {
                 float v = it->second.mf[i][j];
@@ -2079,6 +2085,9 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
                 matrix[i][j] = as_int * (1.0f / 65536.0f);
             }
         }
+#else
+        memcpy(matrix, it->second.mf, sizeof(matrix));
+#endif
     } else {
 #ifndef GBI_FLOATS
         // Original GBI where fixed point matrices are used
@@ -2411,7 +2420,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // as a GPU mip chain (MIP_LOD); LOD_FRACTION is then computed per-pixel in the
     // fragment shader from UV derivatives (TEX_LOD).
     uint8_t mipExtraLevels = DetectMipChain(mRdp->first_tile_index);
-    if (mRdp->other_mode_l & G_TL_LOD) {
+    if (mRdp->other_mode_h & G_TL_LOD) {
         cc_options |= SHADER_OPT(TEX_LOD);
     }
     if (mipExtraLevels > 0) {
@@ -2498,7 +2507,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // TMEM data belongs to the same load as tile 0 (one pyramid), the
         // tmem-index heuristic would bind an unrelated texture for it — sample
         // tile 0 instead (the LOD fraction then blends identical texels).
-        if (i == 1 && tile != mRdp->first_tile_index && (mRdp->other_mode_l & G_TL_LOD) && mipExtraLevels == 0 &&
+        if (i == 1 && tile != mRdp->first_tile_index && (mRdp->other_mode_h & G_TL_LOD) && mipExtraLevels == 0 &&
             (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE) {
             const uint16_t baseTmem = mRdp->texture_tile[mRdp->first_tile_index].tmem;
             const uint16_t lodTmem = mRdp->texture_tile[tile].tmem;
@@ -2709,7 +2718,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             lu.lights[i][1][1] = mRsp->current_lights_coeffs[i][1];
             lu.lights[i][1][2] = mRsp->current_lights_coeffs[i][2];
             if (is_point) {
-                lu.lights[i][1][3] = (float)mRsp->current_lights[i].p.unk7;  // kc
+                lu.lights[i][1][3] = (float)mRsp->current_lights[i].p.unk7; // kc
                 lu.lights[i][2][0] = (float)mRsp->current_lights[i].p.pos[0];
                 lu.lights[i][2][1] = (float)mRsp->current_lights[i].p.pos[1];
                 lu.lights[i][2][2] = (float)mRsp->current_lights[i].p.pos[2];
@@ -2728,8 +2737,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             // Fold the entire CPU UV pipeline (gsSPTexture scale, tile shift, tile
             // origin, bilerp half-texel, texture size normalize) into a linear
             // transform per texture: uv = dot * scale + offset.
-            const bool bilerp_half =
-                (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT && !is_rect;
+            const bool bilerp_half = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT && !is_rect;
             for (int t = 0; t < 2; t++) {
                 if (!usedTextures[t] || tex_width[t] == 0 || tex_height[t] == 0) {
                     continue;
@@ -2850,6 +2858,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             lodParams[0] = resScale;
             lodParams[1] = mRdp->prim_lod_min / 256.0f;
             lodParams[2] = (float)((mRdp->other_mode_h >> G_MDSFT_TEXTDETAIL) & 3);
+            // RGB framebuffer dither mode for the fragment shader, taken from the RDP's
+            // per-primitive G_CD_* setting: 0=magic square, 1=bayer, 2=noise, 3=disable
+            // (truncate only). 4 = feature off (no 5-bit quantization at all).
+            lodParams[3] = mRgbDitherEnabled ? (float)((mRdp->other_mode_h >> G_MDSFT_RGBDITHER) & 3) : 4.0f;
         }
 
         // Palette bank offset + post-lookup filter mode for CI index textures
@@ -4251,6 +4263,31 @@ bool gfx_movemem_handler_otr(F3DGfx** cmd0) {
     return false;
 }
 
+void Interpreter::SetCustomUniform(uint8_t idx, const float values[4]) {
+    if (idx >= GFX_NUM_CUSTOM_UNIFORMS) {
+        SPDLOG_ERROR("SetCustomUniform: register {} out of range (max {})", idx, GFX_NUM_CUSTOM_UNIFORMS - 1);
+        return;
+    }
+    if (memcmp(mCustomUniforms.regs[idx], values, sizeof(float) * 4) != 0) {
+        // Split the batch so the new value only affects draws issued after this point
+        Flush();
+        memcpy(mCustomUniforms.regs[idx], values, sizeof(float) * 4);
+    }
+}
+
+bool gfx_set_uniform_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    const uint8_t idx = (uint8_t)C0(0, 8);
+    // w1 points at four floats owned by the game; values are sampled each time
+    // the display list executes.
+    const float* values = (const float*)gfx->SegAddr(cmd->words.w1);
+    if (values != nullptr) {
+        gfx->SetCustomUniform(idx, values);
+    }
+    return false;
+}
+
 bool gfx_push_shader(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4263,22 +4300,279 @@ bool gfx_push_shader(F3DGfx** cmd0) {
 
     path = &path[7];
 
-    size_t shaderId = static_cast<size_t>(-1);
-    for (const auto& shader : gfx->mShaders) {
-        if (strcmp(shader.second, path) == 0) {
-            shaderId = shader.first;
-            break;
+    gfx->mShaderStack.push(gfx->RegisterShaderPath(path));
+
+    return false;
+}
+
+void Interpreter::ApplyMaterialShader(const char* dlistPath) {
+    if (mMaterialShaders.empty() || dlistPath == nullptr) {
+        return;
+    }
+    if (gfx_check_image_signature(dlistPath)) {
+        dlistPath = &dlistPath[7];
+    }
+    auto it = mMaterialShaders.find(dlistPath);
+    if (it == mMaterialShaders.end()) {
+        return;
+    }
+    mShaderStack.push(RegisterShaderPath(it->second.c_str()));
+    mDlShaderScopes.push_back(g_exec_stack.cmd_stack.size());
+}
+
+void Interpreter::PopMaterialShaderScopes() {
+    const size_t depth = g_exec_stack.cmd_stack.size();
+    while (!mDlShaderScopes.empty() && mDlShaderScopes.back() == depth) {
+        if (!mShaderStack.empty()) {
+            mShaderStack.pop();
+        }
+        mDlShaderScopes.pop_back();
+    }
+}
+
+size_t Interpreter::RegisterShaderPath(const char* path) {
+    for (const auto& shader : mShaders) {
+        if (shader.second == path) {
+            return shader.first;
         }
     }
 
-    if (shaderId == static_cast<size_t>(-1)) {
-        shaderId = gfx->mShadersIndex++;
-        gfx->mShaders[shaderId] = path;
+    // 0xFFFF is the "no custom shader" sentinel in the combiner options
+    if ((mShadersIndex & 0xFFFF) == 0xFFFF) {
+        mShadersIndex++;
+    }
+    size_t shaderId = mShadersIndex++;
+    mShaders[shaderId] = path;
+    return shaderId;
+}
+
+// ========================= post-processing chain =========================
+
+int Interpreter::RegisterPostPass(const char* o2rShaderPath) {
+    std::lock_guard<std::mutex> lock(mPostPassMutex);
+    const int id = mPostPassNextId++;
+    mPostPasses.push_back({ id, o2rShaderPath, "Internal", true });
+    return id;
+}
+
+void Interpreter::UnregisterPostPass(int id) {
+    std::lock_guard<std::mutex> lock(mPostPassMutex);
+    std::erase_if(mPostPasses, [id](const PostPass& p) { return p.id == id; });
+}
+
+void Interpreter::ClearPostPasses() {
+    std::lock_guard<std::mutex> lock(mPostPassMutex);
+    mPostPasses.clear();
+}
+
+std::vector<Interpreter::PostPass> Interpreter::GetPostPasses() {
+    std::lock_guard<std::mutex> lock(mPostPassMutex);
+    return mPostPasses;
+}
+
+void Interpreter::SetPostPassEnabled(int id, bool enabled) {
+    std::lock_guard<std::mutex> lock(mPostPassMutex);
+    for (auto& pass : mPostPasses) {
+        if (pass.id == id) {
+            pass.enabled = enabled;
+            return;
+        }
+    }
+}
+
+bool Interpreter::HasPostPasses() {
+    std::lock_guard<std::mutex> lock(mPostPassMutex);
+    for (const auto& pass : mPostPasses) {
+        if (pass.enabled) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Interpreter::LoadPostPassManifest() {
+    mPostManifestChecked = true;
+
+    auto resourceManager = Ship::Context::GetRawInstance()->GetResourceManager();
+    if (resourceManager == nullptr || resourceManager->GetArchiveManager() == nullptr) {
+        return;
+    }
+    auto archives = resourceManager->GetArchiveManager()->GetArchives();
+    if (archives == nullptr) {
+        return;
     }
 
-    gfx->mShaderStack.push(shaderId);
+    for (const auto& archive : *archives) {
+        if (archive == nullptr) {
+            continue;
+        }
 
-    return false;
+        auto file = archive->LoadFile(std::string("manifest.json"));
+        if (file == nullptr || !file->IsLoaded || file->Buffer == nullptr) {
+            continue;
+        }
+
+        nlohmann::json manifest = nlohmann::json::parse(file->Buffer->begin(), file->Buffer->end(), nullptr, false);
+        if (manifest.is_discarded() || !manifest.contains("shaders") || !manifest["shaders"].is_object()) {
+            continue;
+        }
+
+        const auto& shaders = manifest["shaders"];
+        const std::string packName = manifest.value("name", archive->GetPath());
+
+        if (shaders.contains("passes") && shaders["passes"].is_array()) {
+            for (const auto& entry : shaders["passes"]) {
+                if (!entry.contains("shader") || !entry["shader"].is_string()) {
+                    continue;
+                }
+
+                const std::string shader = entry["shader"].get<std::string>();
+                const bool enabled = entry.value("enabled", true);
+                mShaderPackNames[shader] = packName;
+                std::lock_guard<std::mutex> lock(mPostPassMutex);
+                mPostPasses.push_back({ mPostPassNextId++, shader, packName, enabled });
+                SPDLOG_INFO("Post pass registered from {}: {} ({})", packName, shader,
+                            enabled ? "enabled" : "disabled");
+            }
+        }
+
+        if (shaders.contains("materials") && shaders["materials"].is_array()) {
+            for (const auto& entry : shaders["materials"]) {
+                if (!entry.contains("dlist") || !entry["dlist"].is_string() || !entry.contains("shader") ||
+                    !entry["shader"].is_string() || !entry.value("enabled", true)) {
+                    continue;
+                }
+                const std::string dlist = entry["dlist"].get<std::string>();
+                const std::string shader = entry["shader"].get<std::string>();
+                mMaterialShaders[dlist] = shader;
+                mShaderPackNames[shader] = packName;
+                SPDLOG_INFO("Material shader registered from {}: {} -> {}", packName, dlist, shader);
+            }
+        }
+    }
+}
+
+// Runs the registered passes as fullscreen draws through the regular
+// interpreter pipeline (custom shader id + IMAGERECT), ping-ponging between
+// two managed framebuffers. The game image is the first input; the result is
+// presented by pointing mGfxFrameBuffer at the returned framebuffer.
+int Interpreter::RunPostPasses() {
+    std::vector<PostPass> passes;
+    {
+        std::lock_guard<std::mutex> lock(mPostPassMutex);
+        for (const auto& pass : mPostPasses) {
+            if (pass.enabled) {
+                passes.push_back(pass);
+            }
+        }
+    }
+    if (passes.empty() || !mRendersToFb) {
+        return -1;
+    }
+
+    // Lazily create the ping-pong targets; resize=1 lets the per-frame
+    // framebuffer-dimension tracking keep them at render resolution, and
+    // forceFixedAspect makes a 0..native rect span the full target exactly.
+    for (int i = 0; i < 2; i++) {
+        if (mPostPassFb[i] < 0) {
+            mPostPassFb[i] =
+                CreateFrameBuffer((uint32_t)mNativeDimensions.width, (uint32_t)mNativeDimensions.height,
+                                  (uint32_t)mNativeDimensions.width, (uint32_t)mNativeDimensions.height, 1, true);
+        }
+    }
+
+    // The chain needs a single-sampled input
+    int srcFb = mGameFb;
+    if (mMsaaLevel > 1) {
+        mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
+        srcFb = mGameFbMsaaResolved;
+    }
+
+    // Save the RDP state the chain clobbers (GfxDpImageRectangle rewrites the
+    // tile-0 descriptor and the loaded-texture metadata in place)
+    const uint64_t savedCombine = mRdp->combine_mode;
+    const uint32_t savedOmh = mRdp->other_mode_h;
+    const uint32_t savedOml = mRdp->other_mode_l;
+    const XYWidthHeight savedScissor = mRdp->scissor;
+    const auto savedTile0 = mRdp->texture_tile[0];
+    const auto savedLoadTex0 = mRdp->loaded_texture[0];
+    const auto savedLoadTex1 = mRdp->loaded_texture[1];
+    const uint8_t savedFirstTile = mRdp->first_tile_index;
+    const bool savedTexChanged0 = mRdp->textures_changed[0];
+    const bool savedTexChanged1 = mRdp->textures_changed[1];
+    // Clear the rendering-state texture cache before drawing: the forced
+    // re-import heuristic (mip/indexed comparison) would otherwise fire
+    // against the game's last texture and import it over the fb binding.
+    mRenderingState.mTextures[0] = nullptr;
+    mRenderingState.mTextures[1] = nullptr;
+    // GfxDpImageRectangle re-imports textures when the active tile differs from
+    // its argument; tile 0 must already be current or the flush would import
+    // from the game's stale texture_to_load pointer instead of the bound fb.
+    mRdp->first_tile_index = 0;
+
+    const int32_t w = (int32_t)mNativeDimensions.width;
+    const int32_t h = (int32_t)mNativeDimensions.height;
+
+    int cur = srcFb;
+    int pingpong = 0;
+    for (const auto& pass : passes) {
+        const int dst = mPostPassFb[pingpong];
+
+        Flush();
+        SetFrameBuffer(dst, 1.0f);
+        mActiveFrameBuffer = mFrameBuffers.find(dst);
+        mFbActive = true;
+
+        mRenderingState.viewport = {};
+        mRenderingState.scissor = {};
+
+        // Previous image on tile 0
+        mRapi->SelectTextureFb(cur);
+        mRdp->textures_changed[0] = false;
+        mRdp->textures_changed[1] = false;
+
+        // Deterministic state: 1-cycle, point filtering, no blending, no depth
+        mRdp->other_mode_h = 0;
+        mRdp->other_mode_l = 0;
+        GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_TEXEL0), alpha_comb(0, 0, 0, G_ACMUX_TEXEL0), 0, 0);
+        GfxDpSetScissor(0, 0, 0, (uint32_t)(w << 2), (uint32_t)(h << 2));
+
+        mShaderStack.push(RegisterShaderPath(pass.path.c_str()));
+        GfxDpImageRectangle(0, w, h, 0, 0, 0, 0, w << 2, h << 2, (int16_t)w, (int16_t)h);
+        Flush();
+        mShaderStack.pop();
+
+        cur = dst;
+        pingpong ^= 1;
+    }
+
+    // Restore the surrounding frame state
+    mRdp->combine_mode = savedCombine;
+    mRdp->other_mode_h = savedOmh;
+    mRdp->other_mode_l = savedOml;
+    mRdp->scissor = savedScissor;
+    mRdp->texture_tile[0] = savedTile0;
+    mRdp->loaded_texture[0] = savedLoadTex0;
+    mRdp->loaded_texture[1] = savedLoadTex1;
+    mRdp->first_tile_index = savedFirstTile;
+    // Match how game-authored fb-texture draws behave: leave the changed flags
+    // as they were and let the next SETTIMG re-arm the import with coherent
+    // descriptors. Forcing a re-import here can pair a stale tile descriptor
+    // with the wrong loaded texture.
+    mRdp->textures_changed[0] = savedTexChanged0;
+    mRdp->textures_changed[1] = savedTexChanged1;
+    // The chain re-bound textures behind the rendering-state cache's back;
+    // clear the cached entries so the next draw's forced-reimport heuristic
+    // (mip/indexed comparison) doesn't fire against stale state.
+    mRenderingState.mTextures[0] = nullptr;
+    mRenderingState.mTextures[1] = nullptr;
+    mRdp->viewport_or_scissor_changed = true;
+    mRenderingState.viewport = {};
+    mRenderingState.scissor = {};
+    mFbActive = false;
+    mActiveFrameBuffer = mFrameBuffers.end();
+
+    return cur;
 }
 
 bool gfx_pop_shader(F3DGfx** cmd0) {
@@ -4292,13 +4586,131 @@ bool gfx_pop_shader(F3DGfx** cmd0) {
     return false;
 }
 
+static std::string ShaderSettingCVarKey(const Interpreter::ShaderSettings& entry, const std::string& var) {
+    std::string label = !entry.pack.empty() ? entry.pack : entry.path;
+    for (auto& ch : label) {
+        if (ch == '/' || ch == ' ' || ch == '.') {
+            ch = '_';
+        }
+    }
+    return "gShaderSettings." + label + "." + var;
+}
+
+void gfx_register_shader_settings(int16_t shaderId, const std::vector<prism::SettingDecl>& decls) {
+    if ((uint16_t)shaderId == 0xFFFF || decls.empty()) {
+        return;
+    }
+    auto gfx = mInstance.lock();
+    if (gfx == nullptr) {
+        return;
+    }
+    auto& entry = gfx->mShaderSettings[(size_t)(uint16_t)shaderId];
+    if (entry.path.empty()) {
+        const char* path = gfx_get_shader(shaderId);
+        entry.path = path != nullptr ? path : "";
+        auto packIt = gfx->mShaderPackNames.find(entry.path);
+        if (packIt != gfx->mShaderPackNames.end()) {
+            entry.pack = packIt->second;
+        }
+    }
+    for (const auto& decl : decls) {
+        bool known = false;
+        for (const auto& existing : entry.decls) {
+            if (existing.var == decl.var) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            entry.decls.push_back(decl);
+            auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+            const std::string key = ShaderSettingCVarKey(entry, decl.var);
+            std::array<float, 4> v = { 0.0f, 0.0f, 0.0f, 0.0f };
+            if (decl.type == "color") {
+                static const char* sSuffix[3] = { ".R", ".G", ".B" };
+                for (int i = 0; i < 3; i++) {
+                    v[i] = cvars->GetFloat((key + sSuffix[i]).c_str(), decl.defColor[i]);
+                }
+            } else {
+                v[0] = cvars->GetFloat(key.c_str(), decl.def);
+            }
+            entry.values[decl.var] = v;
+        }
+    }
+}
+
+std::vector<std::pair<std::string, prism::ContextTypes>> gfx_get_shader_setting_values(int16_t shaderId) {
+    std::vector<std::pair<std::string, prism::ContextTypes>> out;
+    if ((uint16_t)shaderId == 0xFFFF) {
+        return out;
+    }
+    auto gfx = mInstance.lock();
+    if (gfx == nullptr) {
+        return out;
+    }
+    auto it = gfx->mShaderSettings.find((size_t)(uint16_t)shaderId);
+    if (it == gfx->mShaderSettings.end()) {
+        return out;
+    }
+    for (const auto& decl : it->second.decls) {
+        const auto& v = it->second.values.at(decl.var);
+        if (decl.type == "toggle") {
+            out.emplace_back(decl.var, prism::ContextTypes{ v[0] != 0.0f ? 1 : 0 });
+        } else if (decl.type == "int" || decl.type == "enum") {
+            out.emplace_back(decl.var, prism::ContextTypes{ (int)v[0] });
+        } else if (decl.type == "color") {
+            out.emplace_back(decl.var, prism::ContextTypes{ prism::format_float_literal(v[0]) + ", " +
+                                                            prism::format_float_literal(v[1]) + ", " +
+                                                            prism::format_float_literal(v[2]) });
+        } else {
+            out.emplace_back(decl.var, prism::ContextTypes{ prism::format_float_literal(v[0]) });
+        }
+    }
+    return out;
+}
+
+void Interpreter::UpdateShaderSettingValue(size_t shaderId, const std::string& var, const float components[4]) {
+    auto it = mShaderSettings.find(shaderId);
+    if (it != mShaderSettings.end()) {
+        memcpy(it->second.values[var].data(), components, sizeof(float) * 4);
+    }
+}
+
+void Interpreter::SetShaderSettingValue(size_t shaderId, const std::string& var, const float components[4]) {
+    auto it = mShaderSettings.find(shaderId);
+    if (it == mShaderSettings.end()) {
+        return;
+    }
+    memcpy(it->second.values[var].data(), components, sizeof(float) * 4);
+
+    const prism::SettingDecl* decl = nullptr;
+    for (const auto& d : it->second.decls) {
+        if (d.var == var) {
+            decl = &d;
+            break;
+        }
+    }
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    const std::string key = ShaderSettingCVarKey(it->second, var);
+    if (decl != nullptr && decl->type == "color") {
+        static const char* sSuffix[3] = { ".R", ".G", ".B" };
+        for (int i = 0; i < 3; i++) {
+            cvars->SetFloat((key + sSuffix[i]).c_str(), components[i]);
+        }
+    } else {
+        cvars->SetFloat(key.c_str(), components[0]);
+    }
+    cvars->Save();
+    // Settings are baked into the generated source; recompile everything
+    gfx_shader_cache_clear();
+}
+
 const char* gfx_get_shader(int16_t id) {
     Interpreter* gfx = mInstance.lock().get();
 
-    for (const std::pair<size_t, const char*>& shader : gfx->mShaders) {
-        if (shader.first == id) {
-            return shader.second;
-        }
+    auto it = gfx->mShaders.find((size_t)(uint16_t)id);
+    if (it != gfx->mShaders.end()) {
+        return it->second.c_str();
     }
 
     return nullptr; // Use no shader
@@ -4428,6 +4840,8 @@ bool gfx_dl_otr_filepath_handler_custom(F3DGfx** cmd0) {
 
     if (C0(16, 1) == 0 && nDL != nullptr) {
         g_exec_stack.call(*cmd0, nDL);
+        Interpreter* gfx = mInstance.lock().get();
+        gfx->ApplyMaterialShader((const char*)fileName);
     } else {
         if (nDL != nullptr) {
             (*cmd0) = nDL;
@@ -4489,6 +4903,12 @@ bool gfx_dl_otr_hash_handler_custom(F3DGfx** cmd0) {
 
         if (gfx != 0) {
             g_exec_stack.call(cmd, gfx);
+            Interpreter* interp = mInstance.lock().get();
+            const char* dlPath =
+                Ship::Context::GetRawInstance()->GetResourceManager()->GetArchiveManager()->HashToCString(hash);
+            if (dlPath != nullptr) {
+                interp->ApplyMaterialShader(dlPath);
+            }
         }
     } else {
         Interpreter* gfx = mInstance.lock().get();
@@ -4558,6 +4978,8 @@ bool gfx_branch_z_otr_handler_f3dex2(F3DGfx** cmd0) {
 bool gfx_end_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     gfx->mMarkerOn = false;
+    // Close any material-shader scope opened for the DL that is returning
+    gfx->PopMaterialShaderScopes();
     g_exec_stack.ret();
     return true;
 }
@@ -5188,6 +5610,46 @@ bool gfx_set_interpolation_index_target(F3DGfx** cmd0) {
     return false;
 }
 
+bool gfx_set_tile_scroll_interp_handler_rdp(F3DGfx** cmd0) {
+    F3DGfx* cmd = *cmd0;
+    Interpreter* gfx = mInstance.lock().get();
+
+    int tile = (int)((cmd->words.w1 >> 24) & 0x7);
+    // Use the exact fraction the matrix interpolation applied for this sub-frame so UVs
+    // stay in lockstep with the vertices. Fall back to even spacing if unset.
+    float step = gfx->mInterpolationFrac;
+    if (step <= 0.0f) {
+        int total = gfx->mInterpolationTotal > 0 ? gfx->mInterpolationTotal : 1;
+        step = (float)(gfx->mInterpolationIndex + 1) / (float)total;
+    }
+
+    float uls, ult, span_s, span_t, delta_uls, delta_ult;
+
+    ++(*cmd0); cmd = *cmd0;
+    memcpy(&uls, &cmd->words.w0, sizeof(float));
+    memcpy(&ult, &cmd->words.w1, sizeof(float));
+
+    ++(*cmd0); cmd = *cmd0;
+    memcpy(&span_s, &cmd->words.w0, sizeof(float));
+    memcpy(&span_t, &cmd->words.w1, sizeof(float));
+
+    ++(*cmd0); cmd = *cmd0;
+    memcpy(&delta_uls, &cmd->words.w0, sizeof(float));
+    memcpy(&delta_ult, &cmd->words.w1, sizeof(float));
+
+    float iuls = uls + delta_uls * (step - 1.0f);
+    float iult = ult + delta_ult * (step - 1.0f);
+
+    gfx->mRdp->texture_tile[tile].uls = iuls;
+    gfx->mRdp->texture_tile[tile].ult = iult;
+    gfx->mRdp->texture_tile[tile].lrs = iuls + span_s;
+    gfx->mRdp->texture_tile[tile].lrt = iult + span_t;
+    gfx->mRdp->textures_changed[0] = true;
+    gfx->mRdp->textures_changed[1] = true;
+
+    return false;
+}
+
 bool gfx_load_tlut_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -5229,8 +5691,7 @@ bool gfx_set_key_r_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    if (gfx->mBufVboNumTris > 0 &&
-        (gfx->mRdp->key_center.r != C1(8, 8) || gfx->mRdp->key_scale.r != C1(0, 8))) {
+    if (gfx->mBufVboNumTris > 0 && (gfx->mRdp->key_center.r != C1(8, 8) || gfx->mRdp->key_scale.r != C1(0, 8))) {
         gfx->Flush();
     }
     gfx->mRdp->key_center.r = C1(8, 8);
@@ -5243,9 +5704,8 @@ bool gfx_set_key_gb_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    if (gfx->mBufVboNumTris > 0 &&
-        (gfx->mRdp->key_center.g != C1(24, 8) || gfx->mRdp->key_scale.g != C1(16, 8) ||
-         gfx->mRdp->key_center.b != C1(8, 8) || gfx->mRdp->key_scale.b != C1(0, 8))) {
+    if (gfx->mBufVboNumTris > 0 && (gfx->mRdp->key_center.g != C1(24, 8) || gfx->mRdp->key_scale.g != C1(16, 8) ||
+                                    gfx->mRdp->key_center.b != C1(8, 8) || gfx->mRdp->key_scale.b != C1(0, 8))) {
         gfx->Flush();
     }
     gfx->mRdp->key_center.g = C1(24, 8);
@@ -5512,6 +5972,8 @@ static constexpr UcodeHandler rdpHandlers = {
     { RDP_G_SETTILESIZE_INTERP,
       { "G_SETTILESIZE_INTERP", gfx_set_tile_size_interp_handler_rdp } },                     // G_SETTILESIZE_INTERP
     { RDP_G_SETTILESIZE_LERP, { "G_SETTILESIZE_LERP", gfx_set_tile_size_lerp_handler_rdp } }, // G_SETTILESIZE_LERP
+    { RDP_G_SETTILESCROLL_INTERP,
+      { "G_SETTILESCROLL_INTERP", gfx_set_tile_scroll_interp_handler_rdp } }, // G_SETTILESCROLL_INTERP
     { RDP_G_TEXRECT, { "G_TEXRECT", gfx_tex_rect_and_flip_handler_rdp } },                    // G_TEXRECT (-28)
     { RDP_G_TEXRECTFLIP, { "G_TEXRECTFLIP", gfx_tex_rect_and_flip_handler_rdp } },            // G_TEXRECTFLIP (-27)
     { RDP_G_RDPLOADSYNC, { "mRdpLOADSYNC", gfx_stubbed_command_handler } },                   // mRdpLOADSYNC (-26)
@@ -5577,6 +6039,7 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_SETTIMG_PAL, { "G_SETTIMG_PAL", gfx_set_timg_pal_handler_custom } },    // G_SETTIMG_PAL (0x41)
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
+    { OTR_G_SETUNIFORM, { "G_SETUNIFORM", gfx_set_uniform_handler_custom } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },
     { RDP_G_LOADBLOCK_WIDE, { "G_LOADBLOCK_WIDE", gfx_load_block_wide_handler_rdp } }, // RDP_G_LOADBLOCK_WIDE (-15)
     { RDP_G_VTX_WIDE, { "G_VTX_WIDE", gfx_vtx_handler_f3dex2 } },                      // RDP_G_VTX_WIDE (-16)
@@ -5787,6 +6250,7 @@ void Interpreter::SpReset() {
     while (!mShaderStack.empty()) {
         mShaderStack.pop();
     }
+    mDlShaderScopes.clear();
     mRsp->modelview_matrix_stack_size = 1;
     mRsp->current_num_lights = 2;
     mRsp->lights_changed = true;
@@ -5923,18 +6387,23 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
+    const bool postPassesActive = HasPostPasses();
+    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || postPassesActive) {
         mRendersToFb = true;
         if (!ViewportMatchesRendererResolution()) {
             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
                                                true, true, true);
+        } else if (postPassesActive) {
+            mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
+                                               true, true, true);
         } else {
             // MSAA framebuffer needs to be resolved to an equally sized target when complete, which must therefore
-            // match the window size
+            // match the window size.
             mRapi->UpdateFramebufferParameters(mGameFb, mGfxCurrentWindowDimensions.width,
                                                mGfxCurrentWindowDimensions.height, mMsaaLevel, false, true, true, true);
         }
-        if (mMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
+        if (mMsaaLevel > 1 && (!ViewportMatchesRendererResolution() || postPassesActive)) {
+            // Single-sample resolve target for the post chain; matches the game fb.
             mRapi->UpdateFramebufferParameters(mGameFbMsaaResolved, mCurDimensions.width, mCurDimensions.height, 1,
                                                false, false, false, false);
         }
@@ -5949,6 +6418,24 @@ GfxExecStack g_exec_stack = {};
 
 void Interpreter::RunGuiOnly() {
     SpReset();
+
+    // Engine built-in custom uniform registers (see CustomUniforms):
+    // [0] = frame count / elapsed seconds / delta seconds, [1] = fb dimensions
+    {
+        static auto sCustomTimeStart = std::chrono::steady_clock::now();
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - sCustomTimeStart).count();
+        const double delta = mCustomFrameCount == 0 ? 0.0 : now - mCustomTimeSeconds;
+        mCustomTimeSeconds = now;
+        mCustomFrameCount++;
+        mCustomUniforms.regs[0][0] = (float)mCustomFrameCount;
+        mCustomUniforms.regs[0][1] = (float)now;
+        mCustomUniforms.regs[0][2] = (float)delta;
+        mCustomUniforms.regs[0][3] = 0.0f;
+        mCustomUniforms.regs[1][0] = (float)mCurDimensions.width;
+        mCustomUniforms.regs[1][1] = (float)mCurDimensions.height;
+        mCustomUniforms.regs[1][2] = mCurDimensions.width > 0 ? 1.0f / mCurDimensions.width : 0.0f;
+        mCustomUniforms.regs[1][3] = mCurDimensions.height > 0 ? 1.0f / mCurDimensions.height : 0.0f;
+    }
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
@@ -5991,6 +6478,29 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
                       const std::unordered_map<Gfx*, Gfx*>& dl_replacements) {
     SpReset();
 
+    // Cache the RGB-dither toggle once per frame; the per-draw uniform block reads
+    // mRgbDitherEnabled (hot path, so no CVar lookup there).
+    mRgbDitherEnabled =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gEnhancements.Graphics.DitherNoise", 0) != 0;
+
+    // Engine built-in custom uniform registers (see CustomUniforms):
+    // [0] = frame count / elapsed seconds / delta seconds, [1] = fb dimensions
+    {
+        static auto sCustomTimeStart = std::chrono::steady_clock::now();
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - sCustomTimeStart).count();
+        const double delta = mCustomFrameCount == 0 ? 0.0 : now - mCustomTimeSeconds;
+        mCustomTimeSeconds = now;
+        mCustomFrameCount++;
+        mCustomUniforms.regs[0][0] = (float)mCustomFrameCount;
+        mCustomUniforms.regs[0][1] = (float)now;
+        mCustomUniforms.regs[0][2] = (float)delta;
+        mCustomUniforms.regs[0][3] = 0.0f;
+        mCustomUniforms.regs[1][0] = (float)mCurDimensions.width;
+        mCustomUniforms.regs[1][1] = (float)mCurDimensions.height;
+        mCustomUniforms.regs[1][2] = mCurDimensions.width > 0 ? 1.0f / mCurDimensions.width : 0.0f;
+        mCustomUniforms.regs[1][3] = mCurDimensions.height > 0 ? 1.0f / mCurDimensions.height : 0.0f;
+    }
+
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
 
@@ -6001,7 +6511,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
-    mRapi->ClearFramebuffer(true, true);
+    mRapi->ClearFramebuffer(false, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
@@ -6032,10 +6542,18 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 
+    if (!mPostManifestChecked) {
+        LoadPostPassManifest();
+    }
+    const int postOutputFb = RunPostPasses();
+
     if (mRendersToFb) {
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
-        if (mMsaaLevel > 1) {
+        if (postOutputFb >= 0) {
+            // Post-processed image; MSAA was already resolved inside the chain
+            mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(postOutputFb);
+        } else if (mMsaaLevel > 1) {
             if (!ViewportMatchesRendererResolution()) {
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
                 mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
@@ -6369,6 +6887,31 @@ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t 
 
 extern "C" void gfx_texture_cache_clear() {
     Fast::mInstance.lock().get()->TextureCacheClear();
+}
+
+extern "C" void gfx_set_custom_uniform(uint8_t idx, const float values[4]) {
+    if (auto gfx = Fast::mInstance.lock()) {
+        gfx->SetCustomUniform(idx, values);
+    }
+}
+
+extern "C" int gfx_register_post_pass(const char* o2rShaderPath) {
+    if (auto gfx = Fast::mInstance.lock()) {
+        return gfx->RegisterPostPass(o2rShaderPath);
+    }
+    return -1;
+}
+
+extern "C" void gfx_unregister_post_pass(int id) {
+    if (auto gfx = Fast::mInstance.lock()) {
+        gfx->UnregisterPostPass(id);
+    }
+}
+
+extern "C" void gfx_clear_post_passes() {
+    if (auto gfx = Fast::mInstance.lock()) {
+        gfx->ClearPostPasses();
+    }
 }
 
 extern "C" void gfx_shader_cache_clear() {

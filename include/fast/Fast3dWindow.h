@@ -80,7 +80,6 @@ class Fast3dWindow : public Ship::Window {
     uint16_t GetPixelDepth(float x, float y);
     void SetTextureFilter(FilteringMode filteringMode);
     void SetRendererUCode(UcodeHandlers ucode);
-    void EnableSRGBMode();
     bool DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements,
                                     const std::unordered_map<Gfx*, Gfx*>& dlReplacements);
 

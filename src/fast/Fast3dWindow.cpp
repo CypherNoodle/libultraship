@@ -165,10 +165,6 @@ void Fast3dWindow::SetTextureFilter(FilteringMode filteringMode) {
     mInterpreter->GetCurrentRenderingAPI()->SetTextureFilter(filteringMode);
 }
 
-void Fast3dWindow::EnableSRGBMode() {
-    mInterpreter->mRapi->SetSrgbMode();
-}
-
 void Fast3dWindow::SetRendererUCode(UcodeHandlers ucode) {
     gfx_set_target_ucode(ucode);
 }
