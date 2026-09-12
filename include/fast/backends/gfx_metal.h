@@ -14,6 +14,7 @@
 #include <simd/simd.h>
 
 static constexpr size_t kMaxVertexBufferPoolSize = 3;
+static constexpr size_t kVertexBufferBaseSize = 256 * 32 * 3 * sizeof(float) * 50;
 static constexpr size_t METAL_MAX_MULTISAMPLE_SAMPLE_COUNT = 8;
 static constexpr size_t MAX_PIXEL_DEPTH_COORDS = 1024;
 
@@ -82,6 +83,7 @@ struct TextureDataMetal {
     // Total mip levels uploaded (0/1 = base level only)
     uint32_t mip_levels;
     bool linear_filtering;
+    bool auto_mipmaps;
 };
 
 struct FramebufferMetal {
@@ -136,6 +138,7 @@ struct DrawUniforms {
     simd::float4 lod_params;
     // Game-bindable register file; lockstep with the metal template's DrawUniforms
     simd::float4 uCustom[GFX_NUM_CUSTOM_UNIFORMS];
+    simd::float4 debug_tint; // HD-replacement debug tint: rgb = color, a = mix amount
 };
 
 struct CoordUniforms {
@@ -210,6 +213,9 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
 
     int mCurrentVertexBufferPoolIndex = 0;
     MTL::Buffer* mVertexBufferPool[kMaxVertexBufferPoolSize];
+    size_t mVertexBufferCapacity[kMaxVertexBufferPoolSize];
+    size_t mVertexBufferPeakThisFrame = 0;
+    size_t mVertexBufferPeakLastFrame = 0;
     std::unordered_map<std::pair<uint64_t, uint64_t>, struct ShaderProgramMetal, hash_pair_shader_ids>
         mShaderProgramPool;
 

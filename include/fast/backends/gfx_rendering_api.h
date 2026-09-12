@@ -39,6 +39,9 @@ struct CombinerUniforms {
     // N64 LOD parameters: x = resolution scale applied to the UV derivatives,
     // y = prim_lod_min (0..1), z = G_TD mode (0 clamp, 1 sharpen, 2 detail)
     float lod_params[4];
+    // Debug tint for HD-replacement visualization: rgb = color, a = mix amount
+    // (0 = no tint, the normal case). Applied in the fragment shader after clamp.
+    float debug_tint[4];
 };
 
 constexpr int GFX_MAX_GPU_LIGHTS = 32;
@@ -158,6 +161,14 @@ class GfxRenderingAPI {
     virtual FilteringMode GetTextureFilter() = 0;
     virtual ImTextureID GetTextureById(int id) = 0;
     virtual void SetCurrentPrimDepth(float depth) = 0;
+    // Set by the interpreter immediately before a CPU-generated mip pyramid is
+    // uploaded. Backends record it per-texture (the next UploadTextureMip at level
+    // 0) so SetSamplerParameters can use trilinear + anisotropic filtering and a
+    // negative LOD bias for these textures. Native N64 mip chains keep their
+    // explicit integer-LOD nearest filtering and leave this false.
+    void SetNextTextureAutoMipmap(bool on) {
+        mNextTextureAutoMipmap = on;
+    }
     // Highest mip/LOD level (as float) usable by the current draw's LOD computation.
     // 0 means only the base level exists.
     virtual void SetCurrentMaxLod(float maxLod) {
@@ -222,5 +233,6 @@ class GfxRenderingAPI {
     bool mCustomUniformsDirty = true;
     int8_t mCurrentCullKeepSign = 0;
     int8_t mLastCullKeepSign = -128; // forces initial apply
+    bool mNextTextureAutoMipmap = false;
 };
 } // namespace Fast

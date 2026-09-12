@@ -91,6 +91,9 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
     if (mCurrentShaderProgram->lod_params_location >= 0) {
         glUniform4fv(mCurrentShaderProgram->lod_params_location, 1, mCombinerUniforms.lod_params);
     }
+    if (mCurrentShaderProgram->debug_tint_location >= 0) {
+        glUniform4fv(mCurrentShaderProgram->debug_tint_location, 1, mCombinerUniforms.debug_tint);
+    }
     if (mCurrentShaderProgram->custom_location >= 0) {
         glUniform4fv(mCurrentShaderProgram->custom_location, GFX_NUM_CUSTOM_UNIFORMS, &mCustomUniforms.regs[0][0]);
     }
@@ -383,7 +386,11 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "texture", "texture" },
         { "vOutColor", "vOutColor" },
 #elif defined(USE_OPENGLES)
+#ifdef __EMSCRIPTEN__
+        { "GLSL_VERSION", "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;" },
+#else
         { "GLSL_VERSION", "#version 300 es\nprecision mediump float;" },
+#endif
         { "attr", "in" },
         { "opengles", true },
         { "core_opengl", false },
@@ -640,6 +647,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->mv_cols_location = glGetUniformLocation(shader_program, "uMvCols");
     prg->palette_params_location = glGetUniformLocation(shader_program, "uPaletteParams");
     prg->lod_params_location = glGetUniformLocation(shader_program, "uLodParams");
+    prg->debug_tint_location = glGetUniformLocation(shader_program, "uDebugTint");
     prg->custom_location = glGetUniformLocation(shader_program, "uCustom");
 
     LoadShader(prg);
@@ -725,6 +733,7 @@ void GfxRenderingAPIOGL::UploadTexture(const uint8_t* rgba32_buf, uint32_t width
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     }
     info.mip_levels = 1;
+    info.auto_mipmaps = false;
 }
 
 void GfxRenderingAPIOGL::UploadTextureMip(const uint8_t* rgba32_buf, uint32_t width, uint32_t height, uint32_t level,
@@ -738,15 +747,18 @@ void GfxRenderingAPIOGL::UploadTextureMip(const uint8_t* rgba32_buf, uint32_t wi
         info.width = width;
         info.height = height;
         info.mip_levels = totalLevels;
+        info.auto_mipmaps = mNextTextureAutoMipmap;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, (GLint)totalLevels - 1);
         // Make the min filter mip-aware immediately; SetSamplerParameters may not
         // run again when the wrap/filter state happens to match its defaults.
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                        info.auto_mipmaps ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST);
     }
 }
 
 #ifdef USE_OPENGLES
-#define GL_MIRROR_CLAMP_TO_EDGE 0x8743
+// 0x8743 is INVALID_ENUM on ES3/WebGL2; mirrored repeat is the closest valid mode
+#define GL_MIRROR_CLAMP_TO_EDGE GL_MIRRORED_REPEAT
 #endif
 
 static uint32_t gfx_cm_to_opengl(uint32_t val) {
@@ -769,14 +781,28 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
         glActiveTexture(GL_TEXTURE0 + tile);
     }
     const GLint filter = linear_filter && mCurrentFilterMode == FILTER_LINEAR ? GL_LINEAR : GL_NEAREST;
-    // Mip chains are sampled with explicit integer LODs (textureLod) in the shader;
-    // MIPMAP_NEAREST picks the exact level while still filtering within it.
-    const bool hasMips = textures[mCurrentTextureIds[tile]].mip_levels > 1;
-    const GLint minFilter = hasMips ? (linear_filter && mCurrentFilterMode != FILTER_NONE ? GL_LINEAR_MIPMAP_NEAREST
-                                                                                          : GL_NEAREST_MIPMAP_NEAREST)
-                                    : filter;
+    const TextureInfo& tex = textures[mCurrentTextureIds[tile]];
+    const bool hasMips = tex.mip_levels > 1;
+    // Auto-generated pyramids use hardware derivative LOD: trilinear between levels
+    // (smooth, no per-pixel level stipple) and anisotropy for grazing-angle surfaces.
+    // Native N64 mip chains are sampled with explicit integer LODs (textureLod) in
+    // the shader; MIPMAP_NEAREST picks the exact level while still filtering within it.
+    GLint minFilter;
+    if (hasMips && tex.auto_mipmaps) {
+        minFilter = (filter == GL_LINEAR) ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR;
+    } else if (hasMips) {
+        minFilter = (linear_filter && mCurrentFilterMode != FILTER_NONE) ? GL_LINEAR_MIPMAP_NEAREST
+                                                                         : GL_NEAREST_MIPMAP_NEAREST;
+    } else {
+        minFilter = filter;
+    }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+#ifdef GL_TEXTURE_MAX_ANISOTROPY
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, tex.auto_mipmaps ? 8.0f : 1.0f);
+#elif defined(GL_TEXTURE_MAX_ANISOTROPY_EXT)
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, tex.auto_mipmaps ? 8.0f : 1.0f);
+#endif
     textures[mCurrentTextureIds[tile]].filtering = !linear_filter ? FILTER_LINEAR : FILTER_THREE_POINT;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gfx_cm_to_opengl(cms));
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, gfx_cm_to_opengl(cmt));
@@ -849,7 +875,7 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
             glEnable(GL_DEPTH_TEST);
             glDepthMask(mLastDepthMask ? GL_TRUE : GL_FALSE);
             glDepthFunc(mCurrentDepthTest
-                            ? (mCurrentZmodeDecal ? (mCurrentStrictDecal ? GL_EQUAL : GL_LEQUAL) : GL_LESS)
+                            ? (mCurrentZmodeDecal ? (mCurrentStrictDecal ? GL_EQUAL : GL_LEQUAL) : GL_LEQUAL)
                             : GL_ALWAYS);
         } else {
             glDisable(GL_DEPTH_TEST);
@@ -900,7 +926,7 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
 }
 
 void GfxRenderingAPIOGL::Init() {
-#if !defined(__linux__) && !defined(__OpenBSD__)
+#if !defined(__linux__) && !defined(__OpenBSD__) && !defined(USE_OPENGLES)
     glewInit();
 #endif
 

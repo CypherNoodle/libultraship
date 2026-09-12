@@ -13,6 +13,8 @@
 #include <string>
 #include <string_view>
 #include <memory>
+#include <future>
+#include <unordered_set>
 
 #include "fast/lus_gbi.h"
 #include "fast/types.h"
@@ -398,6 +400,7 @@ struct GfxTextureCache {
     TextureCacheMap map;
     std::list<TextureCacheMapIter> lru;
     std::vector<uint32_t> free_texture_ids;
+    std::vector<uint32_t> deferred_free_texture_ids;
 };
 
 struct ColorCombiner {
@@ -556,6 +559,8 @@ class Interpreter {
     uint8_t DetectMipChain(uint32_t baseTile) const;
     void UploadBaseTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height);
     void UploadMipChain(uint32_t baseTile);
+    // Box-filter downsample one RGBA32 level into the next (halved, min 1px).
+    static void BoxDownsampleRgba32(const uint8_t* src, uint32_t srcW, uint32_t srcH, uint8_t* dst);
     const RDP::TmemLoadEntry* FindTmemLoad(uint16_t tmemWord) const;
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
     // Opt-in memoization of OTR texture-path resolution, keyed by display-list
@@ -672,13 +677,18 @@ class Interpreter {
     // GPU palettization: the import in progress uploads raw CI indices instead of
     // decoded colors (palette lookup happens in the fragment shader).
     bool mImportIndexed = false;
+    // The import in progress is an HD (upscaled) texture. Auto-generated mipmaps
+    // are only built for these; original low-res N64 textures upload single-level.
+    bool mImportIsHd = false;
     // Palette textures are versioned by TLUT content and never mutated once
     // uploaded: backends queue draw commands (Metal executes at end of frame),
     // so rewriting a bound palette would retroactively recolor earlier draws.
     // A content-hash ring caches one immutable 256-entry texture per TLUT.
-    static constexpr size_t PALETTE_RING_SIZE = 128;
+    static constexpr size_t PALETTE_RING_SIZE = 1024;
     uint32_t mPaletteRingTexture[PALETTE_RING_SIZE];
     uint64_t mPaletteRingHash[PALETTE_RING_SIZE]{};
+    // Last frame each slot was used; a slot used this frame must not be recycled.
+    uint32_t mPaletteRingFrameUsed[PALETTE_RING_SIZE]{};
     size_t mPaletteRingNext = 0;
     std::unordered_map<uint64_t, size_t> mPaletteSlotByHash;
     uint64_t mCurrentPaletteHash = 0;
@@ -688,6 +698,8 @@ class Interpreter {
     // Per-draw palette parameters: x = palette bank entry offset, y = filter mode
     float mPaletteParams[2][4]{};
     uint8_t* mTexUploadBuffer = nullptr;
+    // Ping-pong scratch buffers for CPU-generated mip levels (auto mipmapping)
+    std::vector<uint8_t> mMipScratch[2];
 
     GfxDimensions mGfxCurrentWindowDimensions{}; // gfx_current_window_dimensions;
     int32_t mCurWindowPosX{};
@@ -775,6 +787,37 @@ class Interpreter {
     // N64 RGB framebuffer dither (G_CD_*), applied per-draw in the fragment shader.
     // Cached once per frame from the gEnhancements.Graphics.DitherNoise CVar.
     bool mRgbDitherEnabled = true;
+
+    // Budgeted HD-replacement uploads. Big (e.g. 4K) replacement textures are expensive
+    // to upload; uploading several the same frame they first appear causes a hitch.
+    // We cap how many *new* replacement textures upload per frame and render the base
+    // texture in the meantime (the blend reproduces the base), retrying on later frames.
+    int mReplacementUploadBudget = 1; // max new replacement uploads per frame (0 = unlimited)
+    int mFrameReplacementUploads = 0; // count uploaded so far this frame
+    bool mAllowReplacementDefer = false; // set by the draw path only for non-indexed bases
+    bool mDeferredReplacementUpload = false; // set by ImportTexture when it deferred an upload
+    bool mReplacementUploadedThisCall = false; // set by ImportTexture when it uploaded an HD this call
+
+    // Debug visualization of HD replacement state, tinting each draw in the fragment
+    // shader (gEnhancements.Graphics.TextureReplacementDebug). State per draw:
+    // 1 = HD active (blue, subtle), 2 = just uploaded this frame (green), 3 = base
+    // shown because the HD upload was deferred (red). 0 = no replacement / no tint.
+    bool mTextureReplacementDebug = false;
+    int mDebugTintState = 0;
+
+    // Async texture loading (gEnhancements.Graphics.AsyncTextureLoad). When on (and alt
+    // assets enabled), a texture's HD/replacement resource is decoded on the resource
+    // thread pool while the cheap vanilla version renders; the HD swaps in once its load
+    // finishes ("replaced between frames"), so the render thread never blocks on the decode.
+    bool mAsyncTextureLoad = false;
+    std::unordered_map<std::string, std::shared_future<std::shared_ptr<Ship::IResource>>> mTexFutures;
+    // Textures whose HD version has already been swapped in (uploaded once, now cache-resident);
+    // they bypass the per-frame swap budget so they never flicker back to vanilla.
+    std::unordered_set<std::string> mTexSwappedIn;
+    // Returns the texture resource to draw with: the resolved HD if its async load is ready,
+    // otherwise the vanilla fallback (kicking the async load on first reference). Falls back
+    // to a plain cached load when async is disabled or alt assets are off.
+    std::shared_ptr<Ship::IResource> AcquireDrawTexture(const char* name);
 };
 
 void gfx_set_target_ucode(UcodeHandlers ucode);

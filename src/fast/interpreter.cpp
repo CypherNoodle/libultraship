@@ -288,6 +288,26 @@ void Interpreter::LatchCombinerUniforms() {
         }
     }
 
+    // HD-replacement debug tint (rgb + mix amount). a=0 makes the shader mix a no-op.
+    u.debug_tint[0] = u.debug_tint[1] = u.debug_tint[2] = u.debug_tint[3] = 0.0f;
+    if (mTextureReplacementDebug) {
+        switch (mDebugTintState) {
+            case 1: // HD active — blue
+                u.debug_tint[2] = 1.0f;
+                u.debug_tint[1] = 0.4f;
+                u.debug_tint[3] = 0.40f;
+                break;
+            case 2: // just uploaded this frame — green flash
+                u.debug_tint[1] = 1.0f;
+                u.debug_tint[3] = 0.65f;
+                break;
+            case 3: // base shown because HD upload was deferred — red
+                u.debug_tint[0] = 1.0f;
+                u.debug_tint[3] = 0.65f;
+                break;
+        }
+    }
+
     mRapi->SetCombinerUniforms(u);
 }
 
@@ -680,6 +700,7 @@ uint32_t Interpreter::AcquirePaletteTexture() {
 
     auto it = mPaletteSlotByHash.find(mCurrentPaletteHash);
     if (it != mPaletteSlotByHash.end()) {
+        mPaletteRingFrameUsed[it->second] = mCustomFrameCount;
         return mPaletteRingTexture[it->second];
     }
 
@@ -687,9 +708,17 @@ uint32_t Interpreter::AcquirePaletteTexture() {
     // queued triangles first (they were packed against the previous palette).
     Flush();
 
-    // Take the next ring slot (recycled slots are many rebuilds old, so no
-    // queued draw still references their content)
-    const size_t slot = mPaletteRingNext++ % PALETTE_RING_SIZE;
+    // Reuse a slot not touched this frame; recycling one still referenced by a queued
+    // draw would recolor it on deferred backends. All slots used (>ring size) reuses the cursor.
+    size_t slot = mPaletteRingNext % PALETTE_RING_SIZE;
+    for (size_t scanned = 0; scanned < PALETTE_RING_SIZE; scanned++) {
+        size_t cand = (mPaletteRingNext + scanned) % PALETTE_RING_SIZE;
+        if (mPaletteRingTexture[cand] == 0xFFFFFFFF || mPaletteRingFrameUsed[cand] != mCustomFrameCount) {
+            slot = cand;
+            break;
+        }
+    }
+    mPaletteRingNext = slot + 1;
     if (mPaletteRingTexture[slot] == 0xFFFFFFFF) {
         mPaletteRingTexture[slot] = mRapi->NewTexture();
     } else {
@@ -697,6 +726,7 @@ uint32_t Interpreter::AcquirePaletteTexture() {
     }
     mPaletteRingHash[slot] = mCurrentPaletteHash;
     mPaletteSlotByHash[mCurrentPaletteHash] = slot;
+    mPaletteRingFrameUsed[slot] = mCustomFrameCount;
 
     uint8_t palBuf[256 * 4];
     for (int e = 0; e < 256; e++) {
@@ -721,9 +751,18 @@ void Interpreter::TextureCacheClear() {
     for (const auto& entry : mTextureCache.map) {
         mTextureCache.free_texture_ids.push_back(entry.second.texture_id);
     }
+    // Reclaim ids that were pending deferred recycle so a full reset doesn't lose them.
+    mTextureCache.free_texture_ids.insert(mTextureCache.free_texture_ids.end(),
+                                          mTextureCache.deferred_free_texture_ids.begin(),
+                                          mTextureCache.deferred_free_texture_ids.end());
+    mTextureCache.deferred_free_texture_ids.clear();
     mTextureCache.map.clear();
     mTextureCache.lru.clear();
     mResolvedResourceCache.clear();
+    // Drop async texture futures too — they hold shared_ptrs to resources that an
+    // alt-asset toggle (which calls gfx_texture_cache_clear) has just invalidated.
+    mTexFutures.clear();
+    mTexSwappedIn.clear();
     // Pre-allocate buckets so the map never rehashes during normal operation.
     // Rehashing invalidates all iterators, including those stored in LRU entries.
     mTextureCache.map.reserve(TEXTURE_CACHE_MAX_SIZE);
@@ -733,6 +772,69 @@ void Interpreter::TextureCacheClear() {
 
 void Interpreter::ShaderCacheClear() {
     mRapi->ClearShaderCache();
+}
+
+std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* name) {
+    auto rm = Ship::Context::GetRawInstance()->GetResourceManager();
+
+    // Resolve vanilla vs HD by EXPLICIT path (loadExact) rather than the ResourceManager's
+    // internal alt resolution. This means vanilla ("name") and HD ("alt/name") live under
+    // distinct cache keys, so toggling alt assets at runtime needs no cache purge — which is
+    // what previously forced UnloadResources("*") and crashed audio (raw pointers into freed
+    // sequences/soundfonts). The "alt/" prefix matches what the ResourceManager uses itself.
+    const std::string nameStr = name;
+    const bool alreadyAlt = nameStr.rfind(Ship::IResource::gAltAssetPrefix, 0) == 0;
+
+    // Vanilla: load the exact base path, no HD.
+    if (!rm->IsAltAssetsEnabled() || alreadyAlt) {
+        return rm->LoadResource(name, /*loadExact=*/true);
+    }
+
+    const std::string altName = Ship::IResource::gAltAssetPrefix + nameStr;
+
+    // Synchronous (async loading off): try the HD path, fall back to vanilla when absent.
+    if (!mAsyncTextureLoad) {
+        if (auto hd = rm->LoadResource(altName, /*loadExact=*/true)) {
+            return hd;
+        }
+        return rm->LoadResource(name, /*loadExact=*/true);
+    }
+
+    // Already resolved on an earlier frame: keep using that result (HD if it exists, else
+    // vanilla) unconditionally, so it never flickers back under budget pressure.
+    if (mTexSwappedIn.count(name)) {
+        auto& f = mTexFutures[name];
+        if (f.valid() && f.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            if (auto r = f.get()) {
+                return r;
+            }
+        }
+        return rm->LoadResource(name, /*loadExact=*/true);
+    }
+
+    // Async path: decode the HD ("alt/name") on the thread pool while vanilla renders.
+    auto& fut = mTexFutures[name];
+    if (!fut.valid()) {
+        fut = rm->LoadResourceAsync(altName, /*loadExact=*/true);
+    }
+    if (fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        if (auto res = fut.get()) {
+            // HD decoded. Its first draw triggers the (large) GPU upload — budget that swap-in
+            // so a whole level's HD textures don't all upload the same frame. Over budget →
+            // keep showing vanilla and try again next frame.
+            if (mReplacementUploadBudget > 0 && mFrameReplacementUploads >= mReplacementUploadBudget) {
+                return rm->LoadResource(name, /*loadExact=*/true);
+            }
+            mFrameReplacementUploads++;
+            mTexSwappedIn.insert(name);
+            return res;
+        }
+        // No HD for this texture — settle on vanilla and stop re-checking.
+        mTexSwappedIn.insert(name);
+        return rm->LoadResource(name, /*loadExact=*/true);
+    }
+    // Still decoding — render the cheap vanilla version this frame.
+    return rm->LoadResource(name, /*loadExact=*/true);
 }
 
 bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
@@ -750,7 +852,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
         // Remove the texture that was least recently used
         it = mTextureCache.lru.front().it;
-        mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+        mTextureCache.deferred_free_texture_ids.push_back(it->second.texture_id);
         for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
             if (mRenderingState.mTextures[j] == &*it)
                 mRenderingState.mTextures[j] = nullptr;
@@ -798,7 +900,10 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
                         mRenderingState.mTextures[j] = nullptr;
                 }
                 mTextureCache.lru.erase(it->second.lru_location);
-                mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+                // Defer recycling to the next frame: this delete can happen mid-frame
+                // (gSPInvalidateTexCache) after the texture was already drawn, so reusing
+                // the id now would corrupt the earlier draw on deferred backends.
+                mTextureCache.deferred_free_texture_ids.push_back(it->second.texture_id);
                 mTextureCache.map.erase(it->first);
                 again = true;
                 break;
@@ -811,9 +916,9 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
 }
 
 // Invalidate cache entries whose key references the given palette DRAM addr.
-// Note: skips the free_texture_ids recycle by design — Metal's deferred
-// command encoder would otherwise let earlier draws sample the later draw's
-// replaceRegion'd content when a texture_id is reused.
+// The freed texture ids are recycled on the *next* frame (deferred_free_texture_ids):
+// reusing them in this frame would let a deferred backend's command encoder
+// (Metal/Vulkan/D3D) sample the later draw's re-uploaded content from an earlier draw.
 void Interpreter::TextureCacheDeleteByPalette(const uint8_t* palAddr) {
     for (auto it = mTextureCache.map.begin(); it != mTextureCache.map.end();) {
         if (it->first.palette_addrs[0] == palAddr || it->first.palette_addrs[1] == palAddr) {
@@ -822,6 +927,7 @@ void Interpreter::TextureCacheDeleteByPalette(const uint8_t* palAddr) {
                     mRenderingState.mTextures[j] = nullptr;
             }
             mTextureCache.lru.erase(it->second.lru_location);
+            mTextureCache.deferred_free_texture_ids.push_back(it->second.texture_id);
             it = mTextureCache.map.erase(it);
         } else {
             ++it;
@@ -1432,7 +1538,7 @@ void Interpreter::ImportTextureImg(int tile, bool importReplacement) {
 
     uint16_t width = metadata->width;
     uint16_t height = metadata->height;
-    mRapi->UploadTexture(addr, width, height);
+    UploadBaseTexture(addr, width, height);
 }
 
 void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
@@ -1479,7 +1585,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
 
     if (resultNewLineSize == 4 * width && resultNewHeight == height) {
         // Can use the texture directly since it has the correct dimensions
-        mRapi->UploadTexture(addr, width, height);
+        UploadBaseTexture(addr, width, height);
         return;
     }
 
@@ -1527,7 +1633,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
             uploadHeight = resultNewHeight;
         }
     }
-    mRapi->UploadTexture(mTexUploadBuffer, uploadWidth, uploadHeight);
+    UploadBaseTexture(mTexUploadBuffer, uploadWidth, uploadHeight);
 }
 
 const RDP::TmemLoadEntry* Interpreter::FindTmemLoad(uint16_t tmemWord) const {
@@ -1778,13 +1884,155 @@ static bool DecodeTileToRgba32(uint8_t fmt, uint8_t siz, const uint8_t* src, uin
     return false;
 }
 
-// Routes base-level uploads: when a mip chain is being imported, the base level
-// must announce the total level count so backends can allocate the full chain.
+// Rescale a level's alpha so the same fraction of texels passes a 0.5 alpha test as
+// the base. Keeps box-averaged 1-bit cutouts from fading to a translucent edge halo.
+static void ScaleAlphaToCoverage(uint8_t* buf, size_t count, float targetCoverage) {
+    uint32_t hist[256] = { 0 };
+    for (size_t i = 0; i < count; i++) {
+        hist[buf[i * 4 + 3]]++;
+    }
+    size_t target = (size_t)(targetCoverage * (float)count + 0.5f);
+    if (target == 0) {
+        return;
+    }
+    // Highest alpha threshold at which at least `target` texels still pass.
+    size_t acc = 0;
+    int at = 0;
+    for (int a = 255; a >= 1; a--) {
+        acc += hist[a];
+        if (acc >= target) {
+            at = a;
+            break;
+        }
+    }
+    if (at <= 0) {
+        return;
+    }
+    // Map that threshold to 0.5 (128) so coverage is preserved after the test.
+    float scale = 128.0f / (float)at;
+    for (size_t i = 0; i < count; i++) {
+        int v = (int)((float)buf[i * 4 + 3] * scale + 0.5f);
+        buf[i * 4 + 3] = (uint8_t)(v > 255 ? 255 : v);
+    }
+}
+
+// Box-filter downsample an RGBA32 image to half size (min 1px). RGB is weighted by
+// alpha so transparent texels don't bleed color into the edge; edges clamp on odd sizes.
+void Interpreter::BoxDownsampleRgba32(const uint8_t* src, uint32_t srcW, uint32_t srcH, uint8_t* dst) {
+    uint32_t dstW = std::max(1u, srcW >> 1);
+    uint32_t dstH = std::max(1u, srcH >> 1);
+    for (uint32_t y = 0; y < dstH; y++) {
+        uint32_t sy0 = y * 2;
+        uint32_t sy1 = std::min(sy0 + 1, srcH - 1);
+        for (uint32_t x = 0; x < dstW; x++) {
+            uint32_t sx0 = x * 2;
+            uint32_t sx1 = std::min(sx0 + 1, srcW - 1);
+            const uint8_t* p00 = src + (sy0 * srcW + sx0) * 4;
+            const uint8_t* p01 = src + (sy0 * srcW + sx1) * 4;
+            const uint8_t* p10 = src + (sy1 * srcW + sx0) * 4;
+            const uint8_t* p11 = src + (sy1 * srcW + sx1) * 4;
+            uint8_t* d = dst + (y * dstW + x) * 4;
+
+            uint32_t aSum = (uint32_t)p00[3] + p01[3] + p10[3] + p11[3];
+            d[3] = (uint8_t)((aSum + 2) >> 2);
+            if (aSum == 0) {
+                // Fully transparent block: color is invisible, keep a plain average.
+                for (int c = 0; c < 3; c++) {
+                    d[c] = (uint8_t)((p00[c] + p01[c] + p10[c] + p11[c] + 2) >> 2);
+                }
+            } else {
+                for (int c = 0; c < 3; c++) {
+                    uint32_t w = (uint32_t)p00[c] * p00[3] + (uint32_t)p01[c] * p01[3] +
+                                 (uint32_t)p10[c] * p10[3] + (uint32_t)p11[c] * p11[3];
+                    d[c] = (uint8_t)((w + aSum / 2) / aSum);
+                }
+            }
+        }
+    }
+}
+
 void Interpreter::UploadBaseTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) {
     if (mCurrentMipExtraLevels > 0) {
         mRapi->UploadTextureMip(rgba32Buf, width, height, 0, mCurrentMipExtraLevels + 1u);
-    } else {
+        return;
+    }
+
+    // Palette-indexed textures store raw palette indices (not color) in the red
+    // channel; averaging indices is meaningless, so they stay single-level.
+    // Non-HD (original low-res N64) textures also stay single-level: auto mips are
+    // only worthwhile for upscaled HD replacements.
+    if (!mImportIsHd || mImportIndexed || width <= 1 || height <= 1) {
         mRapi->UploadTexture(rgba32Buf, width, height);
+        return;
+    }
+
+    constexpr uint32_t MIN_MIP_SIZE = 16;
+    uint32_t maxDim = std::max(width, height);
+    uint32_t totalLevels = 1;
+    while ((maxDim >> totalLevels) >= MIN_MIP_SIZE) {
+        totalLevels++;
+    }
+
+    if (totalLevels <= 1) {
+        mRapi->UploadTexture(rgba32Buf, width, height);
+        return;
+    }
+
+    // Tell the backend these levels are auto-generated, so its sampler uses
+    // trilinear + anisotropic filtering (native N64 mips keep nearest LOD).
+    mRapi->SetNextTextureAutoMipmap(true);
+    mRapi->UploadTextureMip(rgba32Buf, width, height, 0, totalLevels);
+    mRapi->SetNextTextureAutoMipmap(false);
+
+    // Debug: tint each generated level a distinct color so mip selection is
+    // visible in-game (distant surfaces change color as lower levels are picked).
+    const bool mipDebug = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gMipDebug", 0) != 0;
+    static const uint8_t kMipDebugColors[][3] = {
+        { 255, 0, 0 },   { 0, 255, 0 },   { 0, 128, 255 }, { 255, 255, 0 },
+        { 255, 0, 255 }, { 0, 255, 255 }, { 255, 255, 255 },
+    };
+
+    // Measure the base image's alpha-test coverage. Only textures with a real
+    // alpha edge (some opaque, some transparent texels) need coverage
+    // preservation; fully opaque/transparent ones are left untouched.
+    const size_t baseTexels = (size_t)width * height;
+    size_t baseOpaque = 0;
+    for (size_t p = 0; p < baseTexels; p++) {
+        if (rgba32Buf[p * 4 + 3] >= 128) {
+            baseOpaque++;
+        }
+    }
+    const bool preserveCoverage = baseOpaque > 0 && baseOpaque < baseTexels;
+    const float baseCoverage = (float)baseOpaque / (float)baseTexels;
+
+    // Ping-pong between the two scratch buffers so each level's source (the
+    // previous level) stays valid while the next is written.
+    const uint8_t* srcBuf = rgba32Buf;
+    uint32_t srcW = width;
+    uint32_t srcH = height;
+    for (uint32_t level = 1; level < totalLevels; level++) {
+        uint32_t dstW = std::max(1u, srcW >> 1);
+        uint32_t dstH = std::max(1u, srcH >> 1);
+        std::vector<uint8_t>& dst = mMipScratch[level & 1];
+        dst.resize((size_t)dstW * dstH * 4);
+        BoxDownsampleRgba32(srcBuf, srcW, srcH, dst.data());
+        if (preserveCoverage) {
+            ScaleAlphaToCoverage(dst.data(), (size_t)dstW * dstH, baseCoverage);
+        }
+        if (mipDebug) {
+            // Tint RGB to this level's color, keep the box-filtered alpha so
+            // cutout shapes stay intact.
+            const uint8_t* color = kMipDebugColors[(level - 1) % 7];
+            for (size_t p = 0; p < (size_t)dstW * dstH; p++) {
+                dst[p * 4 + 0] = color[0];
+                dst[p * 4 + 1] = color[1];
+                dst[p * 4 + 2] = color[2];
+            }
+        }
+        mRapi->UploadTextureMip(dst.data(), dstW, dstH, level, totalLevels);
+        srcBuf = dst.data();
+        srcW = dstW;
+        srcH = dstH;
     }
 }
 
@@ -1838,6 +2086,10 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         importReplacement && (metadata->resource != nullptr)
             ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
             : mRdp->loaded_texture[tmemIdex].addr;
+
+    // Only HD (upscaled) textures get auto-generated mipmaps; original low-res
+    // N64 textures upload single-level. UploadBaseTexture reads this flag.
+    mImportIsHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
 
     // Check if this texture address is a registered GPU framebuffer mirror.
     // If so, bind the GPU FB directly — full resolution, no CPU readback needed.
@@ -1898,8 +2150,22 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         key.indexed = 1;
     }
 
+    if (importReplacement && mAllowReplacementDefer && mReplacementUploadBudget > 0 &&
+        mFrameReplacementUploads >= mReplacementUploadBudget &&
+        mTextureCache.map.find(key) == mTextureCache.map.end()) {
+        mDeferredReplacementUpload = true;
+        return;
+    }
+
     if (TextureCacheLookup(i, key)) {
         return;
+    }
+
+    // Past the lookup on a miss means this replacement will upload now — count it
+    // against this frame's budget so further first-time replacements are deferred.
+    if (importReplacement) {
+        mFrameReplacementUploads++;
+        mReplacementUploadedThisCall = true;
     }
 
     // Guard against zero-sized textures that would cause divide-by-zero
@@ -2449,6 +2715,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // (plus post-lookup bilinear/3-point filtering) runs in the fragment shader.
     // The same index texture is reused across TLUT swaps. Mip chains, masked or
     // blended textures, and HD/raw replacements fall back to CPU decoding.
+    // Reset per draw; the blended-texture path below raises it by replacement state.
+    mDebugTintState = 0;
+
     bool palettized[2] = { false, false };
     for (int i = 0; i < 2; i++) {
         uint32_t pal_tile = mRdp->first_tile_index + i;
@@ -2536,11 +2805,36 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 ImportTexture(i, tile, false);
                 mImportIndexed = false;
                 mCurrentMipExtraLevels = 0;
+                // Masks are binary coverage, not color — they must never carry an
+                // auto-generated mip chain (would blur the cutout edges).
+                mImportIsHd = false;
                 if (mRdp->loaded_texture[i].masked) {
                     ImportTextureMask(SHADER_FIRST_MASK_TEXTURE + i, tile);
                 }
                 if (mRdp->loaded_texture[i].blended) {
+                    // Allow deferring the HD upload only for non-indexed bases — those can
+                    // be bound into the replacement slot as a safe RGBA fallback. Indexed
+                    // bases would sample wrong, so always upload them immediately.
+                    mAllowReplacementDefer = !palettized[i];
+                    mDeferredReplacementUpload = false;
+                    mReplacementUploadedThisCall = false;
                     ImportTexture(SHADER_FIRST_REPLACEMENT_TEXTURE + i, tile, true);
+                    mAllowReplacementDefer = false;
+                    if (mDeferredReplacementUpload && mRenderingState.mTextures[i] != nullptr) {
+                        // HD not uploaded this frame: bind the base into the replacement
+                        // slot so the blend reproduces the base (no pop-in / no garbage).
+                        mRapi->SelectTexture(SHADER_FIRST_REPLACEMENT_TEXTURE + i,
+                                             mRenderingState.mTextures[i]->second.texture_id);
+                        mRenderingState.mTextures[SHADER_FIRST_REPLACEMENT_TEXTURE + i] =
+                            mRenderingState.mTextures[i];
+                    }
+                    if (mTextureReplacementDebug) {
+                        // Highest-priority state wins across the two tiles (red > green > blue).
+                        int state = mDeferredReplacementUpload ? 3 : (mReplacementUploadedThisCall ? 2 : 1);
+                        if (state > mDebugTintState) {
+                            mDebugTintState = state;
+                        }
+                    }
                 }
                 mRdp->textures_changed[i] = false;
             }
@@ -4800,7 +5094,8 @@ bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
         F3DVtx* vtx = (F3DVtx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer(hash);
 
         if (vtx != NULL) {
-            vtx = (F3DVtx*)((char*)vtx + offset);
+            constexpr size_t kN64VtxSize = 16;
+            vtx += offset / kN64VtxSize;
 
             (*cmd0)--;
             F3DGfx* cmd = *cmd0;
@@ -5148,7 +5443,11 @@ static bool IsValidResolvedAddress(uintptr_t addr) {
     }
 
     // Still in the N64 segmented range, but might be a false positive (a real low pointer).
-#ifdef _WIN32
+#if defined(__EMSCRIPTEN__)
+    // The Emscripten heap starts near address 0, so real pointers routinely live below
+    // 0x0FFFFFFF and the range heuristic would drop valid textures.
+    return true;
+#elif defined(_WIN32)
     // For Windows, check whether the address belongs to a dll.
     HMODULE module = nullptr;
     return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -5194,7 +5493,9 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
         }
     }
 
-    if (!IsValidResolvedAddress(i)) {
+    // An OTR resource resolved above is a real pointer by construction; only raw
+    // addresses go through the segmented-range heuristic.
+    if (rawTexMetdata.resource == nullptr && !IsValidResolvedAddress(i)) {
         return false;
     }
 
@@ -5218,9 +5519,12 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
         return false;
     }
 
-    std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(
-            Ship::Context::GetRawInstance()->GetResourceManager()->GetArchiveManager()->HashToCString(hash)));
+    // AcquireDrawTexture caches (no per-frame re-decode — the main level-load/render stall) and,
+    // when async loading is enabled, decodes HD textures off-thread while vanilla renders. The GPU
+    // texture cache keys on the (stable) ImageData pointer + fmt/siz/palette, so cached archive
+    // textures don't collide; only CPU-animated textures mutate in place and skip this path.
+    std::shared_ptr<Fast::Texture> texture =
+        std::static_pointer_cast<Fast::Texture>(mInstance.lock().get()->AcquireDrawTexture(fileName));
     if (texture != nullptr) {
         texFlags = texture->Flags;
         rawTexMetadata.width = texture->Width;
@@ -5229,10 +5533,6 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
         rawTexMetadata.v_pixel_scale = texture->VPixelScale;
         rawTexMetadata.type = texture->Type;
         rawTexMetadata.resource = texture;
-
-        // OTRTODO: We have disabled caching for now to fix a texture corruption issue with HD texture
-        // support. In doing so, there is a potential performance hit since we are not caching lookups. We
-        // need to do proper profiling to see whether or not it is worth it to keep the caching system.
 
         char* tex = reinterpret_cast<char*>(texture->ImageData);
 
@@ -5274,8 +5574,9 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetadata = {};
 
-    std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(fileName));
+    // Cached + async-aware load (see the hash handler above).
+    std::shared_ptr<Fast::Texture> texture =
+        std::static_pointer_cast<Fast::Texture>(mInstance.lock().get()->AcquireDrawTexture(fileName));
     if (texture != nullptr) {
         Interpreter* gfx = mInstance.lock().get();
         texFlags = texture->Flags;
@@ -6443,6 +6744,14 @@ void Interpreter::RunGuiOnly() {
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
+    // Previous frame's GPU work is submitted; ids freed by mid-frame invalidation
+    // last frame are now safe to reuse.
+    if (!mTextureCache.deferred_free_texture_ids.empty()) {
+        mTextureCache.free_texture_ids.insert(mTextureCache.free_texture_ids.end(),
+                                              mTextureCache.deferred_free_texture_ids.begin(),
+                                              mTextureCache.deferred_free_texture_ids.end());
+        mTextureCache.deferred_free_texture_ids.clear();
+    }
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     mRapi->ClearFramebuffer(true, true);
     mRdp->viewport_or_scissor_changed = true;
@@ -6483,6 +6792,20 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRgbDitherEnabled =
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gEnhancements.Graphics.DitherNoise", 0) != 0;
 
+    // Per-frame budget for new HD-replacement texture uploads (0 = unlimited / original
+    // behavior). Spreads big 4K uploads across frames; the base renders until ready.
+    mReplacementUploadBudget = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+        "gEnhancements.Graphics.TextureUploadBudget", 1);
+    mFrameReplacementUploads = 0;
+
+    // Debug visualization of HD-replacement state (per-draw fragment tint).
+    mTextureReplacementDebug = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+                                   "gEnhancements.Graphics.TextureReplacementDebug", 0) != 0;
+
+    // Async texture loading: decode HD/replacement textures off-thread, render vanilla until ready.
+    mAsyncTextureLoad = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+                            "gEnhancements.Graphics.AsyncTextureLoad", 0) != 0;
+
     // Engine built-in custom uniform registers (see CustomUniforms):
     // [0] = frame count / elapsed seconds / delta seconds, [1] = fb dimensions
     {
@@ -6510,6 +6833,14 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
+    // Previous frame's GPU work is submitted; ids freed by mid-frame invalidation
+    // last frame are now safe to reuse.
+    if (!mTextureCache.deferred_free_texture_ids.empty()) {
+        mTextureCache.free_texture_ids.insert(mTextureCache.free_texture_ids.end(),
+                                              mTextureCache.deferred_free_texture_ids.begin(),
+                                              mTextureCache.deferred_free_texture_ids.end());
+        mTextureCache.deferred_free_texture_ids.clear();
+    }
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     mRapi->ClearFramebuffer(false, true);
     mRdp->viewport_or_scissor_changed = true;

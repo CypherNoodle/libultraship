@@ -84,8 +84,9 @@ bool GfxRenderingAPIMetal::MetalInit(SDL_Renderer* renderer) {
     mReadbackQueue = mDevice->newCommandQueue();
 
     for (size_t i = 0; i < kMaxVertexBufferPoolSize; i++) {
-        MTL::Buffer* new_buffer = mDevice->newBuffer(256 * 32 * 3 * sizeof(float) * 50, MTL::ResourceStorageModeShared);
+        MTL::Buffer* new_buffer = mDevice->newBuffer(kVertexBufferBaseSize, MTL::ResourceStorageModeShared);
         mVertexBufferPool[i] = new_buffer;
+        mVertexBufferCapacity[i] = kVertexBufferBaseSize;
     }
 
     autorelease_pool->release();
@@ -385,6 +386,7 @@ void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t wid
     texture->replaceRegion(region, 0, rgba32_buf, bytes_per_row);
     texture_data->texture = texture;
     texture_data->mip_levels = 1;
+    texture_data->auto_mipmaps = false;
 
     autorelease_pool->release();
 }
@@ -414,6 +416,7 @@ void GfxRenderingAPIMetal::UploadTextureMip(const uint8_t* rgba32_buf, uint32_t 
             texture_data->texture = mDevice->newTexture(texture_descriptor);
         }
         texture_data->mip_levels = totalLevels;
+        texture_data->auto_mipmaps = mNextTextureAutoMipmap;
     }
 
     if (texture_data->texture != nullptr && level < texture_data->texture->mipmapLevelCount()) {
@@ -442,9 +445,15 @@ void GfxRenderingAPIMetal::SetSamplerParameters(int tile, bool linear_filter, ui
                                           : MTL::SamplerMinMagFilterNearest;
     sampler_descriptor->setMinFilter(filter);
     sampler_descriptor->setMagFilter(filter);
-    // Mip chains are sampled with explicit integer LODs (level()) in the shader;
-    // Nearest picks the exact level. Harmless for single-level textures.
-    sampler_descriptor->setMipFilter(MTL::SamplerMipFilterNearest);
+    // Native N64 mip chains are sampled with explicit integer LODs (level()) in the
+    // shader; Nearest picks the exact level. CPU auto-generated pyramids use hardware
+    // derivative LOD with trilinear blending (no per-pixel stipple) + anisotropy.
+    if (texture_data->auto_mipmaps) {
+        sampler_descriptor->setMipFilter(MTL::SamplerMipFilterLinear);
+        sampler_descriptor->setMaxAnisotropy(8);
+    } else {
+        sampler_descriptor->setMipFilter(MTL::SamplerMipFilterNearest);
+    }
     sampler_descriptor->setSAddressMode(gfx_cm_to_metal(cms));
     sampler_descriptor->setTAddressMode(gfx_cm_to_metal(cmt));
     sampler_descriptor->setRAddressMode(MTL::SamplerAddressModeRepeat);
@@ -529,7 +538,9 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
         depth_descriptor->setDepthCompareFunction(
             mCurrentDepthTest ? (mCurrentZmodeDecal
                                      ? (mCurrentStrictDecal ? MTL::CompareFunctionEqual : MTL::CompareFunctionLessEqual)
-                                     : MTL::CompareFunctionLess)
+                                     // LessEqual (not Less) so coplanar transparent overlays
+                                     // (e.g. DynOS recolorable parts) at equal depth still draw
+                                     : MTL::CompareFunctionLessEqual)
                               : MTL::CompareFunctionAlways);
 
         MTL::DepthStencilState* depth_stencil_state = mDevice->newDepthStencilState(depth_descriptor);
@@ -565,6 +576,22 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
     }
 
     MTL::Buffer* vertex_buffer = mVertexBufferPool[mCurrentVertexBufferPoolIndex];
+    const size_t needed = mCurrentVertexBufferOffset + sizeof(float) * buf_vbo_len;
+    if (needed > mVertexBufferPeakThisFrame) {
+        mVertexBufferPeakThisFrame = needed;
+    }
+    if (needed > mVertexBufferCapacity[mCurrentVertexBufferPoolIndex]) {
+        // StartFrame grows the buffer to the previous frame's peak; if a single frame spikes
+        // past even that, drop this batch rather than overrun the buffer (would SIGBUS). The
+        // peak above ensures next frame's buffer is sized to fit. Warn once to stay visible.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            SPDLOG_WARN("metal: vertex batch ({} B) exceeds buffer ({} B); dropping this frame, growing next",
+                        needed, mVertexBufferCapacity[mCurrentVertexBufferPoolIndex]);
+        }
+        return;
+    }
     memcpy((char*)vertex_buffer->contents() + mCurrentVertexBufferOffset, buf_vbo, sizeof(float) * buf_vbo_len);
 
     if (!current_framebuffer.mHasBoundVertexShader) {
@@ -636,6 +663,8 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
         }
         mDrawUniforms.lod_params = simd::float4{ mCombinerUniforms.lod_params[0], mCombinerUniforms.lod_params[1],
                                                  mCombinerUniforms.lod_params[2], mCombinerUniforms.lod_params[3] };
+        mDrawUniforms.debug_tint = simd::float4{ mCombinerUniforms.debug_tint[0], mCombinerUniforms.debug_tint[1],
+                                                 mCombinerUniforms.debug_tint[2], mCombinerUniforms.debug_tint[3] };
         for (int i = 0; i < GFX_NUM_CUSTOM_UNIFORMS; i++) {
             mDrawUniforms.uCustom[i] = simd::float4{ mCustomUniforms.regs[i][0], mCustomUniforms.regs[i][1],
                                                      mCustomUniforms.regs[i][2], mCustomUniforms.regs[i][3] };
@@ -691,6 +720,22 @@ void GfxRenderingAPIMetal::StartFrame() {
     if (!mCoordUniformBuffer) {
         mCoordUniformBuffer = mDevice->newBuffer(sizeof(CoordUniforms), MTL::ResourceCPUCacheModeDefaultCache);
     }
+
+    // Grow the buffer we're about to use to fit last frame's peak vertex volume. The pool
+    // index advances at end-of-frame, so this buffer was last used kMaxVertexBufferPoolSize
+    // frames ago — the GPU is done with it, making release+realloc here safe.
+    const int vbIdx = mCurrentVertexBufferPoolIndex;
+    if (mVertexBufferPeakLastFrame > mVertexBufferCapacity[vbIdx]) {
+        size_t newCap = mVertexBufferCapacity[vbIdx];
+        while (newCap < mVertexBufferPeakLastFrame) {
+            newCap *= 2;
+        }
+        mVertexBufferPool[vbIdx]->release();
+        mVertexBufferPool[vbIdx] = mDevice->newBuffer(newCap, MTL::ResourceStorageModeShared);
+        mVertexBufferCapacity[vbIdx] = newCap;
+    }
+    mVertexBufferPeakLastFrame = mVertexBufferPeakThisFrame;
+    mVertexBufferPeakThisFrame = 0;
 
     mCurrentVertexBufferOffset = 0;
 

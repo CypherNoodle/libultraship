@@ -36,6 +36,7 @@ struct PerDrawCB {
     float lod_params[4];
     // Game-bindable register file; lockstep with the HLSL template's PerDrawCB
     float uCustom[GFX_NUM_CUSTOM_UNIFORMS][4];
+    float debug_tint[4]; // HD-replacement debug tint: rgb = color, a = mix amount
 };
 
 struct PerPrimDepthCB {
@@ -57,6 +58,7 @@ struct TextureData {
     // Total mip levels uploaded (0/1 = base level only)
     uint32_t mip_levels;
     bool linear_filtering;
+    bool auto_mipmaps;
 };
 
 struct FramebufferDX11 {

@@ -583,6 +583,7 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
     ThrowIfFailed(
         mDevice->CreateTexture2D(&texture_desc, &resource_data, texture_data->texture.ReleaseAndGetAddressOf()));
     texture_data->mip_levels = 1;
+    texture_data->auto_mipmaps = false;
 
     // Create shader resource view from texture
 
@@ -602,6 +603,7 @@ void GfxRenderingAPIDX11::UploadTextureMip(const uint8_t* rgba32_buf, uint32_t w
         texture_data->width = width;
         texture_data->height = height;
         texture_data->mip_levels = totalLevels;
+        texture_data->auto_mipmaps = mNextTextureAutoMipmap;
 
         // Mip levels arrive one at a time, so the texture must be DEFAULT
         // (updatable) rather than IMMUTABLE.
@@ -630,11 +632,21 @@ void GfxRenderingAPIDX11::UploadTextureMip(const uint8_t* rgba32_buf, uint32_t w
 }
 
 void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt) {
+    TextureData* texture_data = &mTextures[mCurrentTextureIds[tile]];
+
     D3D11_SAMPLER_DESC sampler_desc;
     ZeroMemory(&sampler_desc, sizeof(D3D11_SAMPLER_DESC));
 
-    sampler_desc.Filter = linear_filter && mCurrentFilterMode == FILTER_LINEAR ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
-                                                                               : D3D11_FILTER_MIN_MAG_MIP_POINT;
+    // CPU auto-generated pyramids use anisotropic filtering (trilinear + grazing-angle
+    // sharpness) with a negative LOD bias; native N64 mips keep point/linear mip-point
+    // sampling driven by the shader's explicit integer LOD.
+    if (texture_data->auto_mipmaps) {
+        sampler_desc.Filter = D3D11_FILTER_ANISOTROPIC;
+        sampler_desc.MaxAnisotropy = 8;
+    } else {
+        sampler_desc.Filter = linear_filter && mCurrentFilterMode == FILTER_LINEAR ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
+                                                                                   : D3D11_FILTER_MIN_MAG_MIP_POINT;
+    }
 
     sampler_desc.AddressU = gfx_cm_to_d3d11(cms);
     sampler_desc.AddressV = gfx_cm_to_d3d11(cmt);
@@ -642,7 +654,6 @@ void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uin
     sampler_desc.MinLOD = 0;
     sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
 
-    TextureData* texture_data = &mTextures[mCurrentTextureIds[tile]];
     texture_data->linear_filtering = linear_filter;
 
     // This function is called twice per texture, the first one only to set default values.
@@ -725,7 +736,7 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         depth_stencil_desc.DepthFunc =
             mCurrentDepthTest
                 ? (mCurrentZmodeDecal ? (mCurrentStrictDecal ? D3D11_COMPARISON_EQUAL : D3D11_COMPARISON_LESS_EQUAL)
-                                      : D3D11_COMPARISON_LESS)
+                                      : D3D11_COMPARISON_LESS_EQUAL)
                 : D3D11_COMPARISON_ALWAYS;
         depth_stencil_desc.StencilEnable = false;
 
@@ -819,6 +830,7 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         memcpy(mPerDrawCbData.fog_params, mCombinerUniforms.fog_params, sizeof(mPerDrawCbData.fog_params));
         memcpy(mPerDrawCbData.palette_params, mCombinerUniforms.palette_params, sizeof(mPerDrawCbData.palette_params));
         memcpy(mPerDrawCbData.lod_params, mCombinerUniforms.lod_params, sizeof(mPerDrawCbData.lod_params));
+        memcpy(mPerDrawCbData.debug_tint, mCombinerUniforms.debug_tint, sizeof(mPerDrawCbData.debug_tint));
         memcpy(mPerDrawCbData.uCustom, mCustomUniforms.regs, sizeof(mPerDrawCbData.uCustom));
         D3D11_MAPPED_SUBRESOURCE ms;
         ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
