@@ -572,6 +572,10 @@ class Interpreter {
     // lists carry stable path pointers; off by default.
     void SetResolvedResourceCacheEnabled(bool enabled);
 
+    // Auto-generated mip chains for HD replacements. On by default; a port can turn them off
+    // where the driver cannot draw with them.
+    void SetAutoMipmapsEnabled(bool enabled);
+
     void GfxSpMatrix(uint8_t params, const int32_t* addr);
     void GfxSpPopMatrix(uint32_t count);
     void GfxSpVertex(size_t numVertices, size_t destIndex, const F3DVtx* vertices);
@@ -640,6 +644,7 @@ class Interpreter {
     GfxTextureCache mTextureCache{};
     std::unordered_map<const void*, std::shared_ptr<Ship::IResource>> mResolvedResourceCache;
     bool mResolvedResourceCacheEnabled = false;
+    bool mAutoMipmapsEnabled = true;
     // Same memoization, for the alt-aware texture path (AcquireDrawTexture): the settled
     // resource per path pointer. Alt assets decide what "settled" means, so the map is
     // dropped whenever that setting changes. -1 = no resolution cached yet.

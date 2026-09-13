@@ -647,6 +647,16 @@ ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& 
     return &mPrevCombiner->second;
 }
 
+void Interpreter::SetAutoMipmapsEnabled(bool enabled) {
+    if (mAutoMipmapsEnabled == enabled) {
+        return;
+    }
+    mAutoMipmapsEnabled = enabled;
+    // Textures keep whatever chain they were uploaded with, so drop them all and let the
+    // next draw rebuild them.
+    TextureCacheClear();
+}
+
 void Interpreter::SetResolvedResourceCacheEnabled(bool enabled) {
     mResolvedResourceCacheEnabled = enabled;
     if (!enabled) {
@@ -2179,7 +2189,7 @@ void Interpreter::UploadBaseTexture(const uint8_t* rgba32Buf, uint32_t width, ui
     // channel; averaging indices is meaningless, so they stay single-level.
     // Non-HD (original low-res N64) textures also stay single-level: auto mips are
     // only worthwhile for upscaled HD replacements.
-    if (!mImportIsHd || mImportIndexed || width <= 1 || height <= 1) {
+    if (!mAutoMipmapsEnabled || !mImportIsHd || mImportIndexed || width <= 1 || height <= 1) {
         mRapi->UploadTexture(rgba32Buf, width, height);
         return;
     }
