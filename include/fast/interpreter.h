@@ -628,6 +628,7 @@ class Interpreter {
     static const char* ACMUXtoStr(uint32_t acmux);
     static void GenerateCC(ColorCombiner* comb, const ColorCombinerKey& key);
     static std::string_view GetBaseTexturePath(std::string_view path);
+    const uint8_t* MaskedReplacementData(const RawTexMetadata* metadata);
     static void NormalizeVector(float v[3]);
     static void TransposedMatrixMul(float res[3], const float a[3], const float b[4][4]);
     static void MatrixMul(float res[4][4], const float a[4][4], const float b[4][4]);

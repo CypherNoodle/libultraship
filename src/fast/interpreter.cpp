@@ -996,10 +996,28 @@ bool Interpreter::TilePaletteIsNamed(int tile) const {
 
 std::string_view Interpreter::GetBaseTexturePath(std::string_view path) {
     if (path.starts_with(Ship::IResource::gAltAssetPrefix)) {
-        return path.substr(Ship::IResource::gAltAssetPrefix.length());
+        path = path.substr(Ship::IResource::gAltAssetPrefix.length());
+    }
+
+    // A per-palette replacement ("<raster>@<palette>") stands in for its base raster, so
+    // anything keyed on the raster (blended/masked registrations) has to find it there.
+    const size_t variant = path.rfind('@');
+    if (variant != std::string_view::npos) {
+        path = path.substr(0, variant);
     }
 
     return path;
+}
+
+// The blended/masked replacement registered for this texture, or nullptr when the texture
+// has none. Callers fall back to the texture's own texels; dereferencing a missed lookup
+// used to hand a garbage pointer straight to the upload.
+const uint8_t* Interpreter::MaskedReplacementData(const RawTexMetadata* metadata) {
+    if (metadata == nullptr || metadata->resource == nullptr) {
+        return nullptr;
+    }
+    const auto it = mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path));
+    return it != mMaskedTextures.end() ? it->second.replacementData : nullptr;
 }
 
 void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
@@ -1083,9 +1101,8 @@ static bool IsPyramidLike(uint32_t width, uint32_t height, uint32_t tileW, uint3
 void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
+        importReplacement ? MaskedReplacementData(metadata)
+                          : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
 
     if (addr == nullptr) {
         SPDLOG_ERROR("ImportTextureRgba16: null texture address for tile {}", tile);
@@ -1158,9 +1175,8 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
 void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
+        importReplacement ? MaskedReplacementData(metadata)
+                          : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
 
     if (addr == nullptr) {
         SPDLOG_ERROR("ImportTextureRgba32: null texture address for tile {}", tile);
@@ -1225,9 +1241,8 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
 void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
+        importReplacement ? MaskedReplacementData(metadata)
+                          : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
 
     if (addr == nullptr) {
         SPDLOG_ERROR("ImportTextureIA4: null texture address for tile {}", tile);
@@ -1270,9 +1285,8 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
 void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
+        importReplacement ? MaskedReplacementData(metadata)
+                          : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
 
     if (addr == nullptr) {
         SPDLOG_ERROR("ImportTextureIA8: null texture address for tile {}", tile);
@@ -1312,9 +1326,8 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
 void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
+        importReplacement ? MaskedReplacementData(metadata)
+                          : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
 
     if (addr == nullptr) {
         SPDLOG_ERROR("ImportTextureIA16: null texture address for tile {}", tile);
@@ -1362,9 +1375,8 @@ void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
 void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
+        importReplacement ? MaskedReplacementData(metadata)
+                          : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
 
     if (addr == nullptr) {
         SPDLOG_ERROR("ImportTextureI4: null texture address for tile {}", tile);
@@ -1414,9 +1426,8 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
 void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
+        importReplacement ? MaskedReplacementData(metadata)
+                          : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
 
     if (addr == nullptr) {
         SPDLOG_ERROR("ImportTextureI8: null texture address for tile {}", tile);
@@ -1456,9 +1467,8 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
+        importReplacement ? MaskedReplacementData(metadata)
+                          : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
 
     if (addr == nullptr) {
         SPDLOG_ERROR("ImportTextureCi4: null texture address for tile {}", tile);
@@ -1555,9 +1565,8 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
 void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
+        importReplacement ? MaskedReplacementData(metadata)
+                          : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
 
     if (addr == nullptr) {
         SPDLOG_ERROR("ImportTextureCi8: null texture address for tile {}", tile);
@@ -1641,9 +1650,8 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
 void Interpreter::ImportTextureImg(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
+        importReplacement ? MaskedReplacementData(metadata)
+                          : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
 
     if (addr == nullptr) {
         SPDLOG_ERROR("ImportTextureImg: null texture address for tile {}", tile);
@@ -1719,9 +1727,8 @@ bool Interpreter::UploadVanillaCi(int tile) {
 void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
+        importReplacement ? MaskedReplacementData(metadata)
+                          : mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr;
 
     if (addr == nullptr) {
         SPDLOG_ERROR("ImportTextureRaw: null texture address for tile {}", tile);
@@ -2325,9 +2332,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
 
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* origAddr =
-        importReplacement && (metadata->resource != nullptr)
-            ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
-            : mRdp->loaded_texture[tmemIdex].addr;
+        importReplacement ? MaskedReplacementData(metadata) : mRdp->loaded_texture[tmemIdex].addr;
 
     // Only HD (upscaled) textures get auto-generated mipmaps; original low-res
     // N64 textures upload single-level. UploadBaseTexture reads this flag.
