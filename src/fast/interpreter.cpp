@@ -762,6 +762,7 @@ void Interpreter::TextureCacheClear() {
     mTextureCache.lru.clear();
     mResolvedResourceCache.clear();
     mDrawTextureCache.clear();
+    mAltMissing.clear();
     // Drop async texture futures too — they hold shared_ptrs to resources that an
     // alt-asset toggle (which calls gfx_texture_cache_clear) has just invalidated.
     mTexFutures.clear();
@@ -785,6 +786,7 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
     // remembered here (and the settled async decisions along with it).
     if (mDrawTextureCacheAltAssets != (int8_t)altEnabled) {
         mDrawTextureCache.clear();
+        mAltMissing.clear();
         mTexFutures.clear();
         mTexSwappedIn.clear();
         mDrawTextureCacheAltAssets = (int8_t)altEnabled;
@@ -814,11 +816,23 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
     // distinct cache keys, so toggling alt assets at runtime needs no cache purge — which is
     // what previously forced UnloadResources("*") and crashed audio (raw pointers into freed
     // sequences/soundfonts). The "alt/" prefix matches what the ResourceManager uses itself.
-    const std::string nameStr = name;
+    // Alt lookups are built from the archive name, never the game's "__OTR__" path form:
+    // the signature is a marker the resource manager accepts on the way in, but no archive
+    // holds an "alt/__OTR__..." entry, so prefixing the signed form can only ever miss.
+    constexpr size_t kOtrSignatureLen = 7; // "__OTR__"
+    const char* base = rm->OtrSignatureCheck(name) ? name + kOtrSignatureLen : name;
+    const std::string nameStr = base;
     const bool alreadyAlt = nameStr.rfind(Ship::IResource::gAltAssetPrefix, 0) == 0;
 
     // Vanilla: load the exact base path, no HD.
     if (!altEnabled || alreadyAlt) {
+        return settled(rm->LoadResource(name, /*loadExact=*/true));
+    }
+
+    // A texture with no replacement is the common case when alt assets are on but a pack
+    // only covers part of the game. Remember that miss: re-probing it every draw costs a
+    // resource-manager lookup (and a log line) per bind, which stutters visibly.
+    if (mAltMissing.count(nameStr) != 0) {
         return settled(rm->LoadResource(name, /*loadExact=*/true));
     }
 
@@ -831,6 +845,7 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
             return settled(hd);
         }
         mRepNone++;
+        mAltMissing.insert(nameStr);
         return settled(rm->LoadResource(name, /*loadExact=*/true));
     }
 
@@ -881,6 +896,7 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
         }
         // No HD for this texture — settle on vanilla and stop re-checking.
         mTexSwappedIn.insert(nameStr);
+        mAltMissing.insert(nameStr);
         return settled(rm->LoadResource(name, /*loadExact=*/true));
     }
     // Still decoding — render the cheap vanilla version this frame, and do not remember it.

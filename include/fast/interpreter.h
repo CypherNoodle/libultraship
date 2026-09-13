@@ -644,6 +644,9 @@ class Interpreter {
     // dropped whenever that setting changes. -1 = no resolution cached yet.
     std::unordered_map<const void*, std::shared_ptr<Ship::IResource>> mDrawTextureCache;
     int8_t mDrawTextureCacheAltAssets = -1;
+    // Names known to have no alt/replacement asset, so a partial pack does not re-probe
+    // (and re-log) a guaranteed miss on every draw. Keyed by archive name.
+    std::unordered_set<std::string> mAltMissing;
     // Extra mip levels (beyond the base) for the texture import in progress.
     // Set around ImportTexture calls in GfxSpTri1; 0 everywhere else.
     uint8_t mCurrentMipExtraLevels{};
