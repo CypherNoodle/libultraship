@@ -316,6 +316,7 @@ ShaderProgram* Interpreter::LookupOrCreateShaderProgram(uint64_t id0, uint64_t i
     if (prg == nullptr) {
         mRapi->UnloadShader(mRenderingState.mShaderProgram);
         prg = mRapi->CreateAndLoadNewShader(id0, id1);
+        mFrameShaderCompiles++;
         mRenderingState.mShaderProgram = prg;
     }
     return prg;
@@ -826,8 +827,10 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
     // Synchronous (async loading off): try the HD path, fall back to vanilla when absent.
     if (!mAsyncTextureLoad) {
         if (auto hd = rm->LoadResource(altName, /*loadExact=*/true)) {
+            mRepAlt++;
             return settled(hd);
         }
+        mRepNone++;
         return settled(rm->LoadResource(name, /*loadExact=*/true));
     }
 
@@ -837,8 +840,13 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
         auto& f = mTexFutures[nameStr];
         if (f.valid() && f.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
             if (auto r = f.get()) {
+                mRepAlt++;
                 return settled(r);
             }
+        }
+        mRepNone++;
+        if (mRepExamples.size() < 6) {
+            mRepExamples.push_back(std::string("none ") + name);
         }
         return settled(rm->LoadResource(name, /*loadExact=*/true));
     }
@@ -846,10 +854,21 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
     // Async path: decode the HD ("alt/name") on the thread pool while vanilla renders.
     auto& fut = mTexFutures[nameStr];
     if (!fut.valid()) {
-        fut = rm->LoadResourceAsync(altName, /*loadExact=*/true);
+        mTexSubmitted[name] = std::chrono::steady_clock::now();
+        fut = rm->LoadResourceAsync(altName, /*loadExact=*/true, BS::pr::lowest);
     }
     if (fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         if (auto res = fut.get()) {
+            auto sub = mTexSubmitted.find(name);
+            if (sub != mTexSubmitted.end()) {
+                const auto waited =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sub->second)
+                        .count();
+                if (waited >= 2000) {
+                    SPDLOG_INFO("hd ready {} after {} ms", name, waited);
+                }
+                mTexSubmitted.erase(sub);
+            }
             // HD decoded. Its first draw triggers the (large) GPU upload — budget that swap-in
             // so a whole level's HD textures don't all upload the same frame. Over budget →
             // keep showing vanilla and try again next frame (so this one is not remembered).
@@ -865,6 +884,10 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
         return settled(rm->LoadResource(name, /*loadExact=*/true));
     }
     // Still decoding — render the cheap vanilla version this frame, and do not remember it.
+    mRepPending++;
+    if (mRepExamples.size() < 6) {
+        mRepExamples.push_back(std::string("pending ") + name);
+    }
     return rm->LoadResource(name, /*loadExact=*/true);
 }
 
@@ -909,6 +932,50 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     mRapi->SetSamplerParameters(i, false, 0, 0);
     *n = node;
     return false;
+}
+
+// The replacement to draw a CI tile with when the pack has art for the palette it is
+// bound to: "alt/<raster>@<palette resource name>". Only palettes that are resources
+// have a name; nullptr for a tile drawn with anything else, or when no such variant
+// exists (the caller then decides between the base replacement and the N64 texels).
+std::shared_ptr<Fast::Texture> Interpreter::ResolvePaletteVariant(const RawTexMetadata* metadata, int tile) {
+    if (metadata->resource == nullptr) {
+        return nullptr;
+    }
+    const auto& tt = mRdp->texture_tile[tile];
+    if (tt.fmt != G_IM_FMT_CI || (tt.siz != G_IM_SIZ_4b && tt.siz != G_IM_SIZ_8b)) {
+        return nullptr;
+    }
+    const std::string& path = metadata->resource->GetInitData()->Path;
+    if (!path.starts_with(Ship::IResource::gAltAssetPrefix)) {
+        return nullptr;
+    }
+    const std::string& tlut = mTlutPath[tt.siz == G_IM_SIZ_4b ? (tt.palette & 15) : 0];
+    if (tlut.empty()) {
+        return nullptr;
+    }
+    const size_t slash = tlut.find_last_of('/');
+    const std::string variantPath = path + "@" + (slash == std::string::npos ? tlut : tlut.substr(slash + 1));
+    const auto t0 = std::chrono::steady_clock::now();
+    auto variant =
+        std::static_pointer_cast<Fast::Texture>(Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(variantPath, /*loadExact=*/true));
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (ms >= 50) {
+        SPDLOG_INFO("variant load {} took {} ms", variantPath, ms);
+    }
+    if (variant == nullptr || variant->Width != metadata->width || variant->Height != metadata->height ||
+        variant->Type != metadata->type) {
+        return nullptr;
+    }
+    return variant;
+}
+
+bool Interpreter::TilePaletteIsNamed(int tile) const {
+    const auto& tt = mRdp->texture_tile[tile];
+    if (tt.fmt != G_IM_FMT_CI) {
+        return true;
+    }
+    return !mTlutPath[tt.siz == G_IM_SIZ_4b ? (tt.palette & 15) : 0].empty();
 }
 
 std::string_view Interpreter::GetBaseTexturePath(std::string_view path) {
@@ -1572,6 +1639,67 @@ void Interpreter::ImportTextureImg(int tile, bool importReplacement) {
     UploadBaseTexture(addr, width, height);
 }
 
+static bool DecodeTileToRgba32(uint8_t fmt, uint8_t siz, const uint8_t* src, uint32_t strideBytes, uint32_t width,
+                               uint32_t height, const uint8_t* const palettes[2], uint8_t paletteIndex, uint8_t* dst);
+static uint32_t TileWidthPx(const RDP* rdp, uint32_t tile);
+static uint32_t TileHeightPx(const RDP* rdp, uint32_t tile);
+
+// Decode the vanilla raster behind an HD replacement with the palette currently bound
+// to the tile, and upload that instead. Only whole-image loads (the sprite, glyph and
+// map texture paths) are handled; anything else keeps the replacement.
+bool Interpreter::UploadVanillaCi(int tile) {
+    const auto& tt = mRdp->texture_tile[tile];
+    const auto& loaded = mRdp->loaded_texture[tt.tmem_index];
+    const RawTexMetadata* metadata = &loaded.raw_tex_metadata;
+    if (tt.fmt != G_IM_FMT_CI || (tt.siz != G_IM_SIZ_4b && tt.siz != G_IM_SIZ_8b)) {
+        return false;
+    }
+    if (metadata->resource == nullptr || (metadata->h_byte_scale == 1 && metadata->v_pixel_scale == 1) ||
+        loaded.addr != metadata->resource->ImageData) {
+        return false;
+    }
+    const std::string& path = metadata->resource->GetInitData()->Path;
+    if (!path.starts_with(Ship::IResource::gAltAssetPrefix)) {
+        return false;
+    }
+    auto base = std::static_pointer_cast<Fast::Texture>(
+        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(std::string(GetBaseTexturePath(path)), /*loadExact=*/true));
+    if (base == nullptr || base->ImageData == nullptr ||
+        base->Type != (tt.siz == G_IM_SIZ_4b ? Fast::TextureType::Palette4bpp : Fast::TextureType::Palette8bpp)) {
+        return false;
+    }
+    if (tt.siz == G_IM_SIZ_4b ? mRdp->palettes[tt.palette / 8] == nullptr
+                              : (mRdp->palettes[0] == nullptr || mRdp->palettes[1] == nullptr)) {
+        return false;
+    }
+
+    const uint32_t lineBytes = tt.line_size_bytes;
+    uint32_t width = tt.siz == G_IM_SIZ_4b ? lineBytes * 2 : lineBytes;
+    uint32_t height = lineBytes > 0 ? loaded.orig_size_bytes / lineBytes : 0;
+    if (lineBytes > 0 && (size_t)lineBytes * height > base->ImageDataSize) {
+        height = base->ImageDataSize / lineBytes;
+    }
+    // Replacements clamp to the rendered tile region (see ImportTextureCi4); match it.
+    const uint32_t tileW = TileWidthPx(mRdp, tile);
+    const uint32_t tileH = TileHeightPx(mRdp, tile);
+    if (tileW > 0 && tileW < width) {
+        width = tileW;
+    }
+    if (tileH > 0 && tileH < height) {
+        height = tileH;
+    }
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    if (!DecodeTileToRgba32(tt.fmt, tt.siz, base->ImageData, lineBytes, width, height, mRdp->palettes, tt.palette,
+                            mTexUploadBuffer)) {
+        return false;
+    }
+    mImportIsHd = false;
+    UploadBaseTexture(mTexUploadBuffer, width, height);
+    return true;
+}
+
 void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
@@ -1599,6 +1727,24 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
             return;
         default:
             break;
+    }
+
+    // CI tiles: the pack may carry art per palette ("alt/<raster>@<palette>"); otherwise
+    // the base replacement stands in for every named palette. A palette the game built
+    // at runtime (sprite shading, fog blends) has no name and no art can be keyed to it,
+    // so the tile keeps its N64 texels rather than showing the base in the wrong colours.
+    if (!importReplacement) {
+        if (auto variant = ResolvePaletteVariant(metadata, tile)) {
+            mRepVariant++;
+            addr = variant->ImageData;
+            resource = variant;
+        } else if (!TilePaletteIsNamed(tile) && UploadVanillaCi(tile)) {
+            mRepVanillaCi++;
+            if (mRepExamples.size() < 6 && metadata->resource != nullptr) {
+                mRepExamples.push_back("unnamed palette " + metadata->resource->GetInitData()->Path);
+            }
+            return;
+        }
     }
 
     uint32_t numLoadedBytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes;
@@ -1707,12 +1853,11 @@ uint8_t Interpreter::DetectMipChain(uint32_t baseTile) const {
     const auto& loaded = mRdp->loaded_texture[base.tmem_index];
     // Raw/IMG-flagged and scaled (HD replacement) textures don't follow N64 TMEM
     // layout, so mip levels can't be located by TMEM offsets.
-    if ((loaded.tex_flags & (TEX_FLAG_LOAD_AS_RAW | TEX_FLAG_LOAD_AS_IMG)) != 0) {
-        return 0;
-    }
-    if (loaded.raw_tex_metadata.h_byte_scale != 1 || loaded.raw_tex_metadata.v_pixel_scale != 1) {
-        return 0;
-    }
+    // Replacement data is not laid out like TMEM, so its levels cannot be found at
+    // offsets inside the base load; they can still form a chain when each was
+    // loaded on its own (see ownLoad below).
+    const bool baseIsRaw = (loaded.tex_flags & (TEX_FLAG_LOAD_AS_RAW | TEX_FLAG_LOAD_AS_IMG)) != 0 ||
+                           loaded.raw_tex_metadata.h_byte_scale != 1 || loaded.raw_tex_metadata.v_pixel_scale != 1;
 
     const uint32_t baseW = TileWidthPx(mRdp, baseTile);
     const uint32_t baseH = TileHeightPx(mRdp, baseTile);
@@ -1762,8 +1907,13 @@ uint8_t Interpreter::DetectMipChain(uint32_t baseTile) const {
         // A genuine pyramid lives in one DRAM raster: every level's data must
         // sit shortly after the base level's. This rejects stale tile state
         // (e.g. a leftover LOD tile pointing at some other texture's load).
+        // A level that was loaded on its own, with a load aimed exactly at this
+        // tile's TMEM address, is a level of this pyramid wherever its DRAM
+        // lives: ports that keep each mip as a separate resource load them that
+        // way (PaperBoat's "<name>_mm<n>" map textures).
+        const bool ownLoad = entry->tmem_word == t.tmem && entry != baseEntry;
         const uint8_t* levelAddr = entry->dram_addr + ((uint32_t)t.tmem - entry->tmem_word) * 8;
-        if (levelAddr < baseEntry->dram_addr || levelAddr > baseEntry->dram_addr + 8192) {
+        if (!ownLoad && (baseIsRaw || levelAddr < baseEntry->dram_addr || levelAddr > baseEntry->dram_addr + 8192)) {
             break;
         }
         // The level's data must fit inside the recorded load
@@ -1983,7 +2133,14 @@ void Interpreter::BoxDownsampleRgba32(const uint8_t* src, uint32_t srcW, uint32_
 }
 
 void Interpreter::UploadBaseTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) {
+    mFrameTextureUploads++;
+    mFrameUploadBytes += (size_t)width * height * 4;
     if (mCurrentMipExtraLevels > 0) {
+        mMipBaseWidth = width;
+        mMipBaseHeight = height;
+        // Kept so a level that cannot be produced is filled from the base: a chain
+        // with a missing level is an incomplete texture (black on GL).
+        mMipBaseCopy.assign(rgba32Buf, rgba32Buf + (size_t)width * height * 4);
         mRapi->UploadTextureMip(rgba32Buf, width, height, 0, mCurrentMipExtraLevels + 1u);
         return;
     }
@@ -2067,8 +2224,24 @@ void Interpreter::UploadBaseTexture(const uint8_t* rgba32Buf, uint32_t width, ui
     }
 }
 
+// Nearest-neighbour resample, for fitting a mip level's art to the size the
+// chain needs at that level (a replacement base is several times the N64 size).
+static void ResampleRgba32(const uint8_t* src, uint32_t sw, uint32_t sh, uint8_t* dst, uint32_t dw, uint32_t dh) {
+    for (uint32_t y = 0; y < dh; y++) {
+        const uint32_t sy = (uint32_t)(((uint64_t)y * sh) / dh);
+        for (uint32_t x = 0; x < dw; x++) {
+            const uint32_t sx = (uint32_t)(((uint64_t)x * sw) / dw);
+            memcpy(dst + ((size_t)y * dw + x) * 4, src + ((size_t)sy * sw + sx) * 4, 4);
+        }
+    }
+}
+
 // Decode and upload mip levels 1..N of the pyramid rooted at baseTile.
 // DetectMipChain has already validated the tile descriptors and TMEM journal.
+// Levels are the game's own art (Paper Mario's far levels are authored, not
+// downsampled), each taken from the load that filled its tile: N64 texels
+// decoded with the base tile's palette, or a replacement's pixels. A level is
+// then fitted to exactly half the previous one, as the GPU chain requires.
 void Interpreter::UploadMipChain(uint32_t baseTile) {
     uint32_t totalLevels = mCurrentMipExtraLevels + 1u;
     uint32_t width = TileWidthPx(mRdp, baseTile);
@@ -2080,27 +2253,49 @@ void Interpreter::UploadMipChain(uint32_t baseTile) {
         uint32_t tile = baseTile + l;
         const auto& t = mRdp->texture_tile[tile];
         const RDP::TmemLoadEntry* entry = FindTmemLoad(t.tmem);
-        if (entry == nullptr || !entry->linear) {
-            return;
-        }
-        const uint8_t* src = entry->dram_addr + ((uint32_t)t.tmem - entry->tmem_word) * 8;
         // Dimensions derived by halving the base (upper tile size registers are
         // unreliable); stride comes from the tile's own line setting.
         width = std::max(width >> 1, 1u);
         height = std::max(height >> 1, 1u);
-        uint32_t strideBytes = t.line_size_bytes;
-        if (t.siz == G_IM_SIZ_32b) {
-            // RGBA32 tiles store the TMEM-interleaved stride (half of the DRAM stride)
-            strideBytes *= 2;
+        const uint32_t chainW = std::max(mMipBaseWidth >> l, 1u);
+        const uint32_t chainH = std::max(mMipBaseHeight >> l, 1u);
+        const uint8_t* levelPixels = nullptr;
+        uint32_t levelW = 0, levelH = 0;
+        if (entry != nullptr && entry->linear) {
+            const bool levelIsRaw = (entry->tex_flags & TEX_FLAG_LOAD_AS_RAW) != 0 &&
+                                    entry->meta.type == Fast::TextureType::RGBA32bpp && entry->meta.width > 0;
+            if (levelIsRaw) {
+                // A replacement of this level: its load covers the whole resource
+                levelPixels = entry->dram_addr;
+                levelW = entry->meta.width;
+                levelH = entry->meta.height;
+            } else {
+                const uint8_t* src = entry->dram_addr + ((uint32_t)t.tmem - entry->tmem_word) * 8;
+                uint32_t strideBytes = t.line_size_bytes;
+                if (t.siz == G_IM_SIZ_32b) {
+                    // RGBA32 tiles store the TMEM-interleaved stride (half of the DRAM stride)
+                    strideBytes *= 2;
+                }
+                if (strideBytes > 0 && DecodeTileToRgba32(t.fmt, t.siz, src, strideBytes, width, height,
+                                                          mRdp->palettes, basePalette, mTexUploadBuffer)) {
+                    levelPixels = mTexUploadBuffer;
+                    levelW = width;
+                    levelH = height;
+                }
+            }
         }
-        if (width == 0 || height == 0 || strideBytes == 0) {
-            return;
+        if (levelPixels == nullptr) {
+            // Nothing usable for this level: the base stands in, so the chain stays complete
+            levelPixels = mMipBaseCopy.data();
+            levelW = mMipBaseWidth;
+            levelH = mMipBaseHeight;
         }
-        if (!DecodeTileToRgba32(t.fmt, t.siz, src, strideBytes, width, height, mRdp->palettes, basePalette,
-                                mTexUploadBuffer)) {
-            return;
+        if (levelW != chainW || levelH != chainH) {
+            mMipLevelBuffer.resize((size_t)chainW * chainH * 4);
+            ResampleRgba32(levelPixels, levelW, levelH, mMipLevelBuffer.data(), chainW, chainH);
+            levelPixels = mMipLevelBuffer.data();
         }
-        mRapi->UploadTextureMip(mTexUploadBuffer, width, height, l, totalLevels);
+        mRapi->UploadTextureMip(levelPixels, chainW, chainH, l, totalLevels);
     }
 }
 
@@ -2155,13 +2350,8 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     TextureCacheKey key;
     if (fmt == G_IM_FMT_CI) {
         if (siz == G_IM_SIZ_4b) {
-            uint8_t palSlot = paletteIndex / 8;
-            key = { origAddr,
-                    { palSlot == 0 ? mRdp->palette_dram_addr[0] : nullptr,
-                      palSlot == 1 ? mRdp->palette_dram_addr[1] : nullptr },
-                    fmt,
-                    siz,
-                    paletteIndex,
+            // The bank this tile reads, not whichever palette last landed in its slot
+            key = { origAddr, { mRdp->palette_bank_dram_addr[paletteIndex & 15], nullptr }, fmt, siz, paletteIndex,
                     origSizeBytes };
         } else {
             // CI8 uses both palette halves
@@ -2214,6 +2404,11 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     // if load as raw is set then we load_raw();
     if ((texFlags & TEX_FLAG_LOAD_AS_RAW) != 0) {
         ImportTextureRaw(tile, importReplacement);
+        // A replacement base declares its mip level count when it uploads (see
+        // UploadBaseTexture); the levels must follow or the texture is incomplete.
+        if (mCurrentMipExtraLevels > 0) {
+            UploadMipChain(tile);
+        }
         return;
     }
 
@@ -2844,6 +3039,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mImportIndexed = palettized[i];
                 ImportTexture(i, tile, false);
                 mImportIndexed = false;
+                if (mTextureReplacementDebug && i == 0 && mDebugTintState == 0) {
+                    // Debug view: green when texture 0 is a replacement, red when it is the
+                    // game's texture (blended-texture states above take precedence).
+                    const auto& res = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata.resource;
+                    const bool isAlt = res != nullptr && res->GetInitData()->Path.starts_with(Ship::IResource::gAltAssetPrefix);
+                    mDebugTintState = isAlt ? 2 : 1;
+                }
                 mCurrentMipExtraLevels = 0;
                 // Masks are binary coverage, not color — they must never carry an
                 // auto-generated mip chain (would blur the cutout edges).
@@ -2888,7 +3090,17 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
             uint32_t tex_size_bytes;
             uint32_t line_size;
-            if ((loaded_line_size != loaded_size || loaded_full_line != loaded_size) && loaded_line_size > 0) {
+            const auto& loadedTex = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
+            const bool isHd = loadedTex.raw_tex_metadata.h_byte_scale != 1 ||
+                              loadedTex.raw_tex_metadata.v_pixel_scale != 1;
+            // Raw replacement data is uploaded whole, at its own resolution, and the
+            // tile origin and wrap modes apply to it as they do on hardware: size it in
+            // N64 texels of the load, never in replacement bytes or the tile window.
+            const bool rawHd = isHd && (loadedTex.tex_flags & TEX_FLAG_LOAD_AS_RAW) != 0;
+            if (rawHd && loaded_line_size != loaded_size && loaded_line_size > 0) {
+                line_size = (uint32_t)std::lround(loaded_line_size / loadedTex.raw_tex_metadata.h_byte_scale);
+                tex_size_bytes = loadedTex.orig_size_bytes;
+            } else if ((loaded_line_size != loaded_size || loaded_full_line != loaded_size) && loaded_line_size > 0) {
                 line_size = loaded_line_size;
                 tex_size_bytes = loaded_size;
             } else {
@@ -2930,6 +3142,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                                          triMeta.h_byte_scale, triMeta.v_pixel_scale);
             // Same wrap-period trim as the import paths. The >= tex_width2 guard skips a stale
             // mask left by an FB blit (the pause background), which would otherwise tile the FB.
+            // The CI/IA importers crop an upscaled (non-raw) replacement to the tile
+            // region, so the size must follow; a raw one is uploaded whole (above).
+            const bool croppedHd = isHd && !rawHd;
             uint32_t maskW = mRdp->texture_tile[tile].masks;
             uint32_t maskH = mRdp->texture_tile[tile].maskt;
             if (maskW != 0 && (1u << maskW) >= tex_width2[i] && (1u << maskW) < tex_width[i]) {
@@ -2938,10 +3153,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             if (maskH != 0 && (1u << maskH) >= tex_height2[i] && (1u << maskH) < tex_height[i]) {
                 tex_height[i] = 1u << maskH;
             }
-            if ((pyrLike || (cms & G_TX_CLAMP)) && tex_width2[i] > 0 && tex_width2[i] < tex_width[i]) {
+            if ((croppedHd || pyrLike || (cms & G_TX_CLAMP)) && tex_width2[i] > 0 && tex_width2[i] < tex_width[i]) {
                 tex_width[i] = tex_width2[i];
             }
-            if ((pyrLike || (cmt & G_TX_CLAMP)) && tex_height2[i] > 0 && tex_height2[i] < tex_height[i]) {
+            if ((croppedHd || pyrLike || (cmt & G_TX_CLAMP)) && tex_height2[i] > 0 && tex_height2[i] < tex_height[i]) {
                 tex_height[i] = tex_height2[i];
             }
 
@@ -3157,6 +3372,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             uvTransform[t][3] = (half - mRdp->texture_tile[uv_tile].ult / 4.0f) / (float)tex_height[t];
             texClamp[t][0] = (tex_width2[t] - 0.5f) / (float)tex_width[t];
             texClamp[t][1] = (tex_height2[t] - 0.5f) / (float)tex_height[t];
+            // Size in N64 texels: the LOD derivative is taken against it, so a
+            // replacement uploaded at several times the size selects the same
+            // mip level the RDP would.
+            texClamp[t][2] = (float)tex_width[t];
+            texClamp[t][3] = (float)tex_height[t];
         }
 
         float fogParams[4] = {};
@@ -3565,6 +3785,17 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
         // N64 TMEM palette area starts at tmem word 256. Each CI4 palette = 16 entries = 16 tmem words.
         uint32_t paletteByteOffset = (tmem - 256) * 2;
 
+        // Per 16-entry bank source, so a CI4 tile's cache key names the palette it
+        // is drawn with even when another bank of the same slot was loaded later
+        // (sprites keep their palette in bank 0 and the shading palette in bank 1).
+        const uint32_t firstBank = paletteByteOffset / 32;
+        const auto& tlutRes = mRdp->texture_to_load.raw_tex_metadata.resource;
+        const std::string tlutPath = tlutRes != nullptr ? tlutRes->GetInitData()->Path : std::string();
+        for (uint32_t b = firstBank; b < 16 && (b - firstBank) * 32 < byteCount; b++) {
+            mRdp->palette_bank_dram_addr[b] = src + (b - firstBank) * 32;
+            mTlutPath[b] = tlutPath;
+        }
+
         if (high_index == 255 && paletteByteOffset == 0) {
             // CI8: full 256-entry palette spanning both halves
             memcpy(mRdp->palette_staging[0], src, 256);
@@ -3674,6 +3905,8 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
         entry.size_words = (orig_size_bytes + 7) / 8;
         entry.dram_addr = mRdp->texture_to_load.addr;
         entry.linear = true;
+        entry.tex_flags = mRdp->texture_to_load.tex_flags;
+        entry.meta = mRdp->texture_to_load.raw_tex_metadata;
         mRdp->tmem_load_head = (mRdp->tmem_load_head + 1) % RDP::TMEM_JOURNAL_SIZE;
     }
 
@@ -3757,6 +3990,8 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
         entry.size_words = (orig_size_bytes + 7) / 8;
         entry.dram_addr = mRdp->texture_to_load.addr + start_offset_bytes;
         entry.linear = tile_line_size_bytes == full_image_line_size_bytes;
+        entry.tex_flags = mRdp->texture_to_load.tex_flags;
+        entry.meta = mRdp->texture_to_load.raw_tex_metadata;
         mRdp->tmem_load_head = (mRdp->tmem_load_head + 1) % RDP::TMEM_JOURNAL_SIZE;
     }
 
@@ -5634,7 +5869,7 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
         gfx->GfxDpSetTextureImage(fmt, size, width, fileName, texFlags, rawTexMetadata,
                                   reinterpret_cast<char*>(texture->ImageData));
     } else {
-        SPDLOG_ERROR("G_SETTIMG_OTR_FILEPATH: Texture is null");
+        SPDLOG_ERROR("G_SETTIMG_OTR_FILEPATH: Texture is null ({})", fileName != nullptr ? fileName : "");
     }
     return false;
 }
@@ -6699,6 +6934,27 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 #endif
 }
 
+// Every ~10 s of frames, one line on how draws resolved their replacements in the
+// last frame (numbers are per texture image set that frame, not per triangle).
+void Interpreter::ReportReplacements() {
+    auto repRm = Ship::Context::GetRawInstance()->GetResourceManager();
+    if (++mRepFrames % 600 == 0 && repRm != nullptr && repRm->IsAltAssetsEnabled()) {
+        std::string ex;
+        for (const auto& e : mRepExamples) {
+            ex += " [" + e + "]";
+        }
+        SPDLOG_INFO("replacements: hd={} pending={} none={} (last frame); imports since last report: variant={} vanillaCi={}{}", mRepAlt,
+                    mRepPending, mRepNone, mRepVariant, mRepVanillaCi, ex);
+    }
+    // hd/pending/none are per frame; variant and vanillaCi count imports, which happen
+    // once per texture, so they accumulate between reports.
+    mRepAlt = mRepPending = mRepNone = 0;
+    if (mRepFrames % 600 == 0) {
+        mRepVariant = mRepVanillaCi = 0;
+        mRepExamples.clear();
+    }
+}
+
 void Interpreter::StartFrame() {
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
@@ -6837,6 +7093,10 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mReplacementUploadBudget = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
         "gEnhancements.Graphics.TextureUploadBudget", 1);
     mFrameReplacementUploads = 0;
+    mFrameTextureUploads = 0;
+    mFrameShaderCompiles = 0;
+    mFrameUploadBytes = 0;
+    ReportReplacements();
 
     // Debug visualization of HD-replacement state (per-draw fragment tint).
     mTextureReplacementDebug = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(

@@ -28,7 +28,8 @@ struct CombinerUniforms {
     // RSP texture coordinates to final UVs with uv = raw * scale + offset (the
     // whole tile shift/origin/bilerp/size pipeline folded into one transform).
     float uv_transform[2][4];
-    // Per texture: (clampS bound, clampT bound, unused, unused) in final UV space
+    // Per texture: (clampS bound, clampT bound, width, height); bounds in final UV
+    // space, size in N64 texels (what the LOD derivative is measured against)
     float texture_clamp[2][4];
     // Fog factor source: x = fog_mul, y = fog_offset, z = constant factor,
     // w = mode (0: compute from z/w, 1: constant z, 2: vertex alpha)

@@ -14,6 +14,7 @@
 #include <string_view>
 #include <memory>
 #include <future>
+#include <chrono>
 #include <unordered_set>
 
 #include "fast/lus_gbi.h"
@@ -307,6 +308,7 @@ struct RDP {
     // Original DRAM source address of the most recent TLUT load per palette half.
     // Used in texture cache keys instead of palettes[] (which always points to staging).
     const uint8_t* palette_dram_addr[2];
+    const uint8_t* palette_bank_dram_addr[16]; // DRAM source of each 16-entry CI4 bank
     // CI4 palette staging buffer: N64 TMEM holds up to 16 CI4 palettes (16 entries x 2 bytes each = 32 bytes per
     // palette). palettes[0] covers indices 0-7 (256 bytes), palettes[1] covers 8-15 (256 bytes). GfxDpLoadTlut copies
     // TLUT data here at the correct offset so multi-palette CI4 models work.
@@ -356,6 +358,8 @@ struct RDP {
         uint16_t size_words;      // length in 64-bit words
         const uint8_t* dram_addr; // DRAM source of the load
         bool linear;              // true when DRAM data is contiguous (LoadBlock)
+        uint32_t tex_flags;       // the load's texture flags (raw replacement data or N64 texels)
+        RawTexMetadata meta;      // and its replacement scale, so a mip level can be decoded on its own
     } tmem_loads[TMEM_JOURNAL_SIZE];
     uint8_t tmem_load_head; // next slot to write (circular)
 
@@ -799,6 +803,15 @@ class Interpreter {
     // texture in the meantime (the blend reproduces the base), retrying on later frames.
     int mReplacementUploadBudget = 1; // max new replacement uploads per frame (0 = unlimited)
     int mFrameReplacementUploads = 0; // count uploaded so far this frame
+    // Per-frame activity counters for the host's slow-frame log (reset with the budget)
+    int mFrameTextureUploads = 0;
+    // Replacement report (see ReportReplacements): per-frame counts by outcome
+    int mRepAlt = 0, mRepPending = 0, mRepNone = 0, mRepVanillaCi = 0, mRepVariant = 0;
+    std::vector<std::string> mRepExamples;
+    uint32_t mRepFrames = 0;
+    void ReportReplacements();
+    int mFrameShaderCompiles = 0;
+    size_t mFrameUploadBytes = 0;
     bool mAllowReplacementDefer = false; // set by the draw path only for non-indexed bases
     bool mDeferredReplacementUpload = false; // set by ImportTexture when it deferred an upload
     bool mReplacementUploadedThisCall = false; // set by ImportTexture when it uploaded an HD this call
@@ -816,9 +829,19 @@ class Interpreter {
     // finishes ("replaced between frames"), so the render thread never blocks on the decode.
     bool mAsyncTextureLoad = false;
     std::unordered_map<std::string, std::shared_future<std::shared_ptr<Ship::IResource>>> mTexFutures;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> mTexSubmitted; // for the ready-time log
     // Textures whose HD version has already been swapped in (uploaded once, now cache-resident);
     // they bypass the per-frame swap budget so they never flicker back to vanilla.
     std::unordered_set<std::string> mTexSwappedIn;
+    // Resource path of the TLUT in each CI4 bank (CI8 uses bank 0), empty when it was
+    // loaded from a raw pointer. Names the "alt/<raster>@<palette>" replacement variant.
+    std::string mTlutPath[16];
+    std::shared_ptr<Fast::Texture> ResolvePaletteVariant(const RawTexMetadata* metadata, int tile);
+    bool TilePaletteIsNamed(int tile) const;
+    uint32_t mMipBaseWidth = 0, mMipBaseHeight = 0; // level-0 upload size of the current chain
+    std::vector<uint8_t> mMipLevelBuffer;
+    std::vector<uint8_t> mMipBaseCopy;
+    bool UploadVanillaCi(int tile);
     // Returns the texture resource to draw with: the resolved HD if its async load is ready,
     // otherwise the vanilla fallback (kicking the async load on first reference). Falls back
     // to a plain cached load when async is disabled or alt assets are off.
