@@ -2114,6 +2114,13 @@ static void ScaleAlphaToCoverage(uint8_t* buf, size_t count, float targetCoverag
     }
     // Map that threshold to 0.5 (128) so coverage is preserved after the test.
     float scale = 128.0f / (float)at;
+    // Only ever raise alpha. Coverage preservation exists to stop an alpha-tested cutout
+    // thinning as it downsamples; on a mostly opaque texture the threshold search lands
+    // near 255 and this would instead scale every opaque texel to ~128, turning the whole
+    // level half transparent - which a blended (non alpha-tested) texture shows directly.
+    if (scale <= 1.0f) {
+        return;
+    }
     for (size_t i = 0; i < count; i++) {
         int v = (int)((float)buf[i * 4 + 3] * scale + 0.5f);
         buf[i * 4 + 3] = (uint8_t)(v > 255 ? 255 : v);
@@ -2337,6 +2344,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     // Only HD (upscaled) textures get auto-generated mipmaps; original low-res
     // N64 textures upload single-level. UploadBaseTexture reads this flag.
     mImportIsHd = metadata->h_byte_scale != 1 || metadata->v_pixel_scale != 1;
+
 
     // Check if this texture address is a registered GPU framebuffer mirror.
     // If so, bind the GPU FB directly — full resolution, no CPU readback needed.
