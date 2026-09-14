@@ -814,11 +814,6 @@ class Interpreter {
     int mFrameReplacementUploads = 0; // count uploaded so far this frame
     // Per-frame activity counters for the host's slow-frame log (reset with the budget)
     int mFrameTextureUploads = 0;
-    // Replacement report (see ReportReplacements): per-frame counts by outcome
-    int mRepAlt = 0, mRepPending = 0, mRepNone = 0, mRepVanillaCi = 0, mRepVariant = 0;
-    std::vector<std::string> mRepExamples;
-    uint32_t mRepFrames = 0;
-    void ReportReplacements();
     int mFrameShaderCompiles = 0;
     size_t mFrameUploadBytes = 0;
     bool mAllowReplacementDefer = false; // set by the draw path only for non-indexed bases
@@ -850,6 +845,17 @@ class Interpreter {
     uint32_t mMipBaseWidth = 0, mMipBaseHeight = 0; // level-0 upload size of the current chain
     std::vector<uint8_t> mMipLevelBuffer;
     std::vector<uint8_t> mMipBaseCopy;
+    // The part of a raster a tile's load covers, in raster bytes and rows.
+    struct RasterRegion {
+        uint32_t xBytes;      // where the loaded rows start within a raster row
+        uint32_t y;           // first raster row loaded
+        uint32_t lineBytes;   // raster bytes per loaded row
+        uint32_t rows;
+        uint32_t strideBytes; // raster bytes per row of the whole image
+    };
+    bool HasHdReplacement(const RawTexMetadata* metadata) const;
+    bool TileRasterRegion(int tile, RasterRegion& region) const;
+    std::shared_ptr<Fast::Texture> VanillaCiSource(int tile, RasterRegion& region) const;
     bool UploadVanillaCi(int tile);
     // Returns the texture resource to draw with: the resolved HD if its async load is ready,
     // otherwise the vanilla fallback (kicking the async load on first reference). Falls back
