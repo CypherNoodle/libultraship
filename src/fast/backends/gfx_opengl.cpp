@@ -882,8 +882,9 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
         }
     }
 
-    if (mCurrentZmodeDecal != mLastZmodeDecal) {
+    if (mCurrentZmodeDecal != mLastZmodeDecal || mCurrentStrictDecal != mLastBiasStrictDecal) {
         mLastZmodeDecal = mCurrentZmodeDecal;
+        mLastBiasStrictDecal = mCurrentStrictDecal;
         if (mCurrentZmodeDecal && !mCurrentStrictDecal) {
             // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
             // fighting
@@ -910,6 +911,7 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
                 default:
                     SSDB = -2;
             }
+            mDecalSlopeBias = SSDB;
             glPolygonOffset(SSDB, -2);
             glEnable(GL_POLYGON_OFFSET_FILL);
         } else {
@@ -922,6 +924,35 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
 
     // printf("flushing %d tris\n", buf_vbo_num_tris);
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
+
+    if (mCurrentZmodeDecal && !mCurrentStrictDecal && mCurrentDepthTest) {
+        // The RDP draws a decal only where the depth buffer already holds a surface close
+        // to it; polygon offset alone also draws it over anything farther away, so a decal
+        // whose wall is gone keeps floating. Two passes with one stencil bit: mark what is
+        // within the bias in front of the buffer, then draw what is also within it behind.
+        constexpr GLuint decalBit = 0x80;
+        glEnable(GL_STENCIL_TEST);
+        glStencilMask(decalBit);
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glDepthMask(GL_FALSE);
+        glDepthFunc(GL_GEQUAL);
+        glPolygonOffset(-mDecalSlopeBias, 2);
+        glStencilFunc(GL_ALWAYS, decalBit, decalBit);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
+
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(mLastDepthMask ? GL_TRUE : GL_FALSE);
+        glDepthFunc(GL_LEQUAL);
+        glPolygonOffset(mDecalSlopeBias, -2);
+        glStencilFunc(GL_EQUAL, decalBit, decalBit);
+        glStencilOp(GL_KEEP, GL_ZERO, GL_ZERO);
+        glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
+
+        glStencilMask(0xFF);
+        glDisable(GL_STENCIL_TEST);
+        return;
+    }
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
 }
 
@@ -1075,7 +1106,7 @@ void GfxRenderingAPIOGL::ClearFramebuffer(bool color, bool depth) {
     }
     glDepthMask(GL_TRUE);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT : 0));
+    glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT : 0));
     glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
     if (mLastScissorEnabled != 1) {
         mLastScissorEnabled = 1;
@@ -1092,7 +1123,7 @@ void GfxRenderingAPIOGL::ClearDepthRegion(int x, int y, int w, int h) {
     glEnable(GL_SCISSOR_TEST);
     glScissor(x, y, w, h);
     glDepthMask(GL_TRUE);
-    glClear(GL_DEPTH_BUFFER_BIT);
+    glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
 
     // Restore previous scissor state.

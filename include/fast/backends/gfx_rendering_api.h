@@ -223,6 +223,8 @@ class GfxRenderingAPI {
     int8_t mLastDepthTest = -1;
     int8_t mLastDepthMask = -1;
     int8_t mLastZmodeDecal = -1;
+    bool mLastBiasStrictDecal = false;
+    float mDecalSlopeBias = -2.0f;
     int8_t mLastStrictDecal = -1;
     float mCurrentPrimDepth = 0.0f;
     bool mPrimDepthDirty = true;
