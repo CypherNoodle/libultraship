@@ -969,8 +969,15 @@ std::shared_ptr<Fast::Texture> Interpreter::ResolvePaletteVariant(const RawTexMe
     if (tlut.empty()) {
         return nullptr;
     }
+    return LoadPaletteVariant(metadata, tlut);
+}
+
+// "alt/<raster>@<palette basename>", when the pack has it at the raster's own size.
+std::shared_ptr<Fast::Texture> Interpreter::LoadPaletteVariant(const RawTexMetadata* metadata,
+                                                               const std::string& tlut) {
     const size_t slash = tlut.find_last_of('/');
-    const std::string variantPath = path + "@" + (slash == std::string::npos ? tlut : tlut.substr(slash + 1));
+    const std::string variantPath =
+        metadata->resource->GetInitData()->Path + "@" + (slash == std::string::npos ? tlut : tlut.substr(slash + 1));
     const auto t0 = std::chrono::steady_clock::now();
     auto variant =
         std::static_pointer_cast<Fast::Texture>(Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(variantPath, /*loadExact=*/true));
@@ -979,10 +986,73 @@ std::shared_ptr<Fast::Texture> Interpreter::ResolvePaletteVariant(const RawTexMe
         SPDLOG_INFO("variant load {} took {} ms", variantPath, ms);
     }
     if (variant == nullptr || variant->Width != metadata->width || variant->Height != metadata->height ||
-        variant->Type != metadata->type) {
+        variant->Type != metadata->type || variant->ImageDataSize != metadata->resource->ImageDataSize) {
         return nullptr;
     }
     return variant;
+}
+
+// The HD art for a tile drawn through a palette the game lerps between two named ones:
+// each end's variant (the base where the pack has none) mixed by the same alpha. nullptr
+// when the tile is not drawn through such a palette, or both ends are the base.
+const uint8_t* Interpreter::BlendPaletteVariants(const RawTexMetadata* metadata, int tile) {
+    const auto& tt = mRdp->texture_tile[tile];
+    if (tt.fmt != G_IM_FMT_CI || (tt.siz != G_IM_SIZ_4b && tt.siz != G_IM_SIZ_8b)) {
+        return nullptr;
+    }
+    const PaletteBlend& blend = mTlutBlend[tt.siz == G_IM_SIZ_4b ? (tt.palette & 15) : 0];
+    if (blend.to.empty() || !HasHdReplacement(metadata)) {
+        return nullptr;
+    }
+    const auto from = LoadPaletteVariant(metadata, blend.from);
+    const auto to = LoadPaletteVariant(metadata, blend.to);
+    const uint8_t* a = from != nullptr ? from->ImageData : metadata->resource->ImageData;
+    const uint8_t* b = to != nullptr ? to->ImageData : metadata->resource->ImageData;
+    if (a == b) {
+        return nullptr;
+    }
+    if (blend.alpha == 0) {
+        return a;
+    }
+    if (blend.alpha == 255) {
+        return b;
+    }
+    const size_t size = metadata->resource->ImageDataSize;
+    mPaletteBlendBuffer.resize(size);
+    for (size_t i = 0; i < size; i++) {
+        mPaletteBlendBuffer[i] = (uint8_t)((a[i] * (255 - blend.alpha) + b[i] * blend.alpha) / 255);
+    }
+    return mPaletteBlendBuffer.data();
+}
+
+// Records the lerp for the frame; the TLUT load of that palette picks it up. Its
+// colors move with the alpha, so what was drawn through it before is dropped.
+void Interpreter::SetPaletteBlend(const uint8_t* palette, const char* from, const char* to, uint8_t alpha) {
+    PaletteBlend& blend = mPaletteBlends[palette];
+    if (blend.alpha != alpha || blend.from != from || blend.to != to) {
+        TextureCacheDeleteByPalette(palette);
+        blend.from = from;
+        blend.to = to;
+        blend.alpha = alpha;
+    }
+    blend.frame = mCustomFrameCount;
+}
+
+void Interpreter::SetPaletteMask(const uint8_t* palette, uint8_t opaque, uint8_t transparent) {
+    mPaletteMasks[palette] = { opaque, transparent, mCustomFrameCount };
+}
+
+// The mask a CI tile with an HD replacement reads through, or nullptr.
+const Interpreter::PaletteMask* Interpreter::TilePaletteMask(int tile) const {
+    const auto& tt = mRdp->texture_tile[tile];
+    if (tt.fmt != G_IM_FMT_CI || (tt.siz != G_IM_SIZ_4b && tt.siz != G_IM_SIZ_8b)) {
+        return nullptr;
+    }
+    const PaletteMask& mask = mTlutMask[tt.siz == G_IM_SIZ_4b ? (tt.palette & 15) : 0];
+    if (mask.opaque < 0 || !HasHdReplacement(&mRdp->loaded_texture[tt.tmem_index].raw_tex_metadata)) {
+        return nullptr;
+    }
+    return &mask;
 }
 
 bool Interpreter::TilePaletteIsNamed(int tile) const {
@@ -990,7 +1060,11 @@ bool Interpreter::TilePaletteIsNamed(int tile) const {
     if (tt.fmt != G_IM_FMT_CI) {
         return true;
     }
-    return !mTlutPath[tt.siz == G_IM_SIZ_4b ? (tt.palette & 15) : 0].empty();
+    const int bank = tt.siz == G_IM_SIZ_4b ? (tt.palette & 15) : 0;
+    // A lerp between two named palettes counts as named for HD art (mixed from each
+    // end's variant) and not for N64 texels (drawn through the lerp itself).
+    return !mTlutPath[bank].empty() ||
+           (!mTlutBlend[bank].to.empty() && HasHdReplacement(&mRdp->loaded_texture[tt.tmem_index].raw_tex_metadata));
 }
 
 std::string_view Interpreter::GetBaseTexturePath(std::string_view path) {
@@ -1756,7 +1830,38 @@ bool Interpreter::UploadVanillaCi(int tile) {
         return false;
     }
     const uint8_t* src = base->ImageData + start;
-    if (mImportIndexed) {
+    const PaletteMask* mask = mImportIndexed ? TilePaletteMask(tile) : nullptr;
+    if (mask != nullptr) {
+        // The replacement's own silhouette, as indices: the mask then lines up with the HD
+        // art it is drawn over, and still costs no upload when the tones change.
+        const RawTexMetadata& meta = mRdp->loaded_texture[tt.tmem_index].raw_tex_metadata;
+        const uint32_t texelsPerByte = tt.siz == G_IM_SIZ_4b ? 2 : 1;
+        // replacement pixels per texel: h_byte_scale is in bytes, and a pixel is four
+        const uint32_t xScale = (uint32_t)std::lround(meta.h_byte_scale) / (4 * texelsPerByte);
+        const uint32_t yScale = (uint32_t)std::lround(meta.v_pixel_scale);
+        const uint32_t stride = region.strideBytes * texelsPerByte * xScale;
+        const uint8_t* hd = meta.resource->ImageData +
+                            ((size_t)region.y * yScale * stride + region.xBytes * texelsPerByte * xScale) * 4;
+        const uint8_t* end = meta.resource->ImageData + meta.resource->ImageDataSize;
+        width *= xScale;
+        height *= yScale;
+        while (height > 0 && hd + ((size_t)(height - 1) * stride + width) * 4 > end) {
+            height--;
+        }
+        if (width == 0 || height == 0) {
+            return false;
+        }
+        uint8_t* dst = mTexUploadBuffer;
+        for (uint32_t y = 0; y < height; y++) {
+            const uint8_t* row = hd + (size_t)y * stride * 4;
+            for (uint32_t x = 0; x < width; x++, dst += 4) {
+                dst[0] = (uint8_t)(row[x * 4 + 3] >= 128 ? mask->opaque : mask->transparent);
+                dst[1] = 0;
+                dst[2] = 0;
+                dst[3] = 255;
+            }
+        }
+    } else if (mImportIndexed) {
         // One index texture serves every palette built from this raster, so the shading
         // pass changing tone each frame costs no upload.
         const bool ci4 = tt.siz == G_IM_SIZ_4b;
@@ -1809,11 +1914,14 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
 
     // The pack may carry art per palette ("alt/<raster>@<palette>"); otherwise the base
     // stands in for every named palette. A palette built at run time (sprite shading,
-    // status tints) has no name, so the tile keeps its N64 texels through it.
+    // status tints) has no name, so the tile keeps its N64 texels through it, unless the
+    // game says which two named palettes it lerps between.
     if (!importReplacement) {
         if (auto variant = ResolvePaletteVariant(metadata, tile)) {
             addr = variant->ImageData;
             resource = variant;
+        } else if (const uint8_t* mixed = BlendPaletteVariants(metadata, tile)) {
+            addr = mixed;
         } else if (!TilePaletteIsNamed(tile) && UploadVanillaCi(tile)) {
             return;
         }
@@ -2447,6 +2555,11 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         key.palette_addrs[1] = nullptr;
         key.palette_index = 0;
         key.indexed = 1;
+        if (const PaletteMask* mask = TilePaletteMask(tile)) {
+            key.indexed = 2;
+            key.mask[0] = (uint8_t)mask->opaque;
+            key.mask[1] = (uint8_t)mask->transparent;
+        }
     }
 
     if (importReplacement && mAllowReplacementDefer && mReplacementUploadBudget > 0 &&
@@ -3111,7 +3224,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             // so a mode change must re-run the import even when the tile data didn't change.
             if (mRenderingState.mTextures[i] != nullptr &&
                 ((i == 0 && mRenderingState.mTextures[0]->first.mip_levels != mipExtraLevels) ||
-                 mRenderingState.mTextures[i]->first.indexed != (palettized[i] ? 1 : 0))) {
+                 (mRenderingState.mTextures[i]->first.indexed != 0) != palettized[i])) {
                 mRdp->textures_changed[i] = true;
             }
             if (mRdp->textures_changed[i]) {
@@ -3874,9 +3987,16 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
         const uint32_t firstBank = paletteByteOffset / 32;
         const auto& tlutRes = mRdp->texture_to_load.raw_tex_metadata.resource;
         const std::string tlutPath = tlutRes != nullptr ? tlutRes->GetInitData()->Path : std::string();
+        // What the game said a raw palette is this frame (gDPPaletteBlend, gDPPaletteMask)
+        const auto blend = tlutRes == nullptr ? mPaletteBlends.find(src) : mPaletteBlends.end();
+        const auto mask = tlutRes == nullptr ? mPaletteMasks.find(src) : mPaletteMasks.end();
+        const bool lerped = blend != mPaletteBlends.end() && blend->second.frame == mCustomFrameCount;
+        const bool masked = mask != mPaletteMasks.end() && mask->second.frame == mCustomFrameCount;
         for (uint32_t b = firstBank; b < 16 && (b - firstBank) * 32 < byteCount; b++) {
             mRdp->palette_bank_dram_addr[b] = src + (b - firstBank) * 32;
             mTlutPath[b] = tlutPath;
+            mTlutBlend[b] = lerped ? blend->second : PaletteBlend{};
+            mTlutMask[b] = masked ? mask->second : PaletteMask{};
         }
 
         if (high_index == 255 && paletteByteOffset == 0) {
@@ -6023,6 +6143,36 @@ bool gfx_inval_tex_by_pal_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// G_PAL_BLEND: the palette at w1 is the game's lerp between the two palette resources
+// named by the next Gfx, by the alpha in w0. See gDPPaletteBlend.
+bool gfx_palette_blend_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    const uint8_t* palette = (const uint8_t*)(uintptr_t)cmd->words.w1;
+    const uint8_t alpha = C0(0, 8);
+    cmd = ++(*cmd0);
+    const char* from = (const char*)cmd->words.w0;
+    const char* to = (const char*)cmd->words.w1;
+    // Either end may be palette bytes rather than a name (no such resource), and then
+    // the palette has no HD art to mix.
+    if (palette != nullptr && gfx_check_image_signature(from) == 1 && gfx_check_image_signature(to) == 1) {
+        gfx->SetPaletteBlend(palette, from, to, alpha);
+    }
+    return false;
+}
+
+// G_PAL_MASK: through the palette at w1, opaque texels read one entry and transparent
+// texels another (both in w0). See gDPPaletteMask.
+bool gfx_palette_mask_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    const uint8_t* palette = (const uint8_t*)(uintptr_t)cmd->words.w1;
+    if (palette != nullptr) {
+        gfx->SetPaletteMask(palette, C0(8, 8), C0(0, 8));
+    }
+    return false;
+}
+
 bool gfx_set_strict_decal_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -6705,6 +6855,8 @@ static constexpr UcodeHandler otrHandlers = {
     { RDP_G_TRI1_WIDE, { "G_TRI1_WIDE", gfx_tri1_handler_f3dex2 } },                   // RDP_G_TRI1_WIDE (-17)
     { OTR_G_INVAL_TEX_BY_PAL, { "G_INVAL_TEX_BY_PAL", gfx_inval_tex_by_pal_handler_custom } },
     { OTR_G_SET_STRICT_DECAL, { "G_SET_STRICT_DECAL", gfx_set_strict_decal_handler_custom } },
+    { OTR_G_PAL_BLEND, { "G_PAL_BLEND", gfx_palette_blend_handler_custom } },
+    { OTR_G_PAL_MASK, { "G_PAL_MASK", gfx_palette_mask_handler_custom } },
 };
 
 static constexpr UcodeHandler f3dex2Handlers = {
@@ -7187,6 +7339,12 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
+
+    // Last frame's records stay, so a lerp that carries on unchanged keeps its uploads;
+    // anything older is a palette the game has moved on from.
+    const auto stale = [this](const auto& entry) { return entry.second.frame + 1 < mCustomFrameCount; };
+    std::erase_if(mPaletteBlends, stale);
+    std::erase_if(mPaletteMasks, stale);
 
     mCurMtxReplacements = &mtx_replacements;
     mCurDlReplacements = &dl_replacements;
