@@ -11,7 +11,7 @@
 #endif
 #include "ship/Context.h"
 #include "ship/window/Window.h"
-#ifdef __unix__
+#if defined(__unix__) && !defined(__SWITCH__)
 #include <dlfcn.h>
 #include <cxxabi.h>
 #endif
@@ -50,7 +50,7 @@ char* FileDropMgr::GetDroppedFile() const {
 }
 
 static void PrintRegError(void* funcAddr) {
-#ifdef __unix__
+#if defined(__unix__) && !defined(__SWITCH__)
     Dl_info info;
     int gotAddress = dladdr(funcAddr, &info);
     const char* nameFound = info.dli_sname;
