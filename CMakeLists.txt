@@ -59,7 +59,10 @@ include(cmake/dependencies/common.cmake)
 
 if(NINTENDO_SWITCH)
     target_link_libraries(ImGui PUBLIC SDL2::SDL2 OpenGL::GL lus_switch_glad)
-    target_compile_definitions(ImGui PRIVATE IMGUI_IMPL_OPENGL_LOADER_CUSTOM)
+    target_compile_definitions(ImGui PRIVATE
+        IMGUI_IMPL_OPENGL_LOADER_CUSTOM
+        IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS
+    )
     set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
         PROPERTIES COMPILE_OPTIONS "-include;glad/glad.h")
 endif()
