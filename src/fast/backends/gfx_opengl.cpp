@@ -798,10 +798,12 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+    const bool repeats = (cms & (G_TX_MIRROR | G_TX_CLAMP)) == 0 || (cmt & (G_TX_MIRROR | G_TX_CLAMP)) == 0;
+    const float anisotropy = tex.auto_mipmaps && !repeats ? 8.0f : 1.0f;
 #ifdef GL_TEXTURE_MAX_ANISOTROPY
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, tex.auto_mipmaps ? 8.0f : 1.0f);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, anisotropy);
 #elif defined(GL_TEXTURE_MAX_ANISOTROPY_EXT)
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, tex.auto_mipmaps ? 8.0f : 1.0f);
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, anisotropy);
 #endif
     textures[mCurrentTextureIds[tile]].filtering = !linear_filter ? FILTER_LINEAR : FILTER_THREE_POINT;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gfx_cm_to_opengl(cms));
