@@ -957,7 +957,7 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
 }
 
 void GfxRenderingAPIOGL::Init() {
-#if !defined(__linux__) && !defined(__OpenBSD__) && !defined(USE_OPENGLES)
+#if !defined(__SWITCH__) && !defined(__linux__) && !defined(__OpenBSD__) && !defined(USE_OPENGLES)
     glewInit();
 #endif
 

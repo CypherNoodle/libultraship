@@ -88,7 +88,7 @@ bool Fast3dGui::SupportsViewports() {
     }
 #endif
 
-#if defined(__ANDROID__) || defined(__IOS__)
+#if defined(__SWITCH__) || defined(__ANDROID__) || defined(__IOS__)
     return false;
 #endif
 

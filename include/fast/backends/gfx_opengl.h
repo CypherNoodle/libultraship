@@ -4,7 +4,10 @@
 #include "gfx_rendering_api.h"
 #include "../interpreter.h"
 
-#ifdef _MSC_VER
+#ifdef __SWITCH__
+#include <SDL2/SDL.h>
+#include <glad/glad.h>
+#elif defined(_MSC_VER)
 #include <SDL2/SDL.h>
 // #define GL_GLEXT_PROTOTYPES 1
 #include <GL/glew.h>

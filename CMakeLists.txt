@@ -47,7 +47,22 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     include(cmake/dependencies/windows-vcpkg.cmake)
 endif()
 
+if(NINTENDO_SWITCH)
+    set(ENABLE_SCRIPTING OFF CACHE BOOL "" FORCE)
+    set(DISABLE_DLL_LOADER ON CACHE BOOL "" FORCE)
+    set(INCLUDE_MPQ_SUPPORT OFF CACHE BOOL "" FORCE)
+    set(USE_OPENGLES OFF CACHE BOOL "" FORCE)
+    include(cmake/dependencies/switch.cmake)
+endif()
+
 include(cmake/dependencies/common.cmake)
+
+if(NINTENDO_SWITCH)
+    target_link_libraries(ImGui PUBLIC SDL2::SDL2 OpenGL::GL lus_switch_glad)
+    target_compile_definitions(ImGui PRIVATE IMGUI_IMPL_OPENGL_LOADER_CUSTOM)
+    set_source_files_properties(${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+        PROPERTIES COMPILE_OPTIONS "-include;glad/glad.h")
+endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Android")
 	include(cmake/dependencies/android.cmake)

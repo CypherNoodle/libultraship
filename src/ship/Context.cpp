@@ -474,6 +474,10 @@ std::string Context::GetShortName() const {
 }
 
 std::string Context::GetAppBundlePath() {
+#ifdef __SWITCH__
+    const char* appDir = std::getenv("SHIP_HOME");
+    return appDir ? appDir : ".";
+#endif
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {
@@ -540,6 +544,9 @@ std::string Context::GetAppBundlePath() {
 }
 
 std::string Context::GetAppDirectoryPath(const std::string& appName) {
+#ifdef __SWITCH__
+    return GetAppBundlePath();
+#endif
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {

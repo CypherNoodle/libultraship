@@ -1,6 +1,7 @@
 #if defined(ENABLE_OPENGL) || defined(__APPLE__)
 
 #include <stdio.h>
+#include <cstdlib>
 
 #include "fast/Fast3dWindow.h"
 
@@ -21,7 +22,10 @@
 #include <sys/time.h>
 #endif
 
-#if FOR_WINDOWS
+#if defined(__SWITCH__)
+#include <SDL2/SDL.h>
+#include <glad/glad.h>
+#elif FOR_WINDOWS
 #include <GL/glew.h>
 #include "SDL.h"
 #define GL_GLEXT_PROTOTYPES 1
@@ -390,6 +394,10 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+#elif defined(__SWITCH__)
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, 0);
 #elif defined(USE_OPENGLES)
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -439,6 +447,12 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         mWindowHeight = (int)canvasH;
     }
 #endif
+#ifdef __SWITCH__
+    // A fixed 720p surface also works when docked; SDL handles presentation scaling.
+    mWindowWidth = 1280;
+    mWindowHeight = 720;
+    flags = SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL;
+#endif
     mWnd = SDL_CreateWindow(title, posX, posY, mWindowWidth, mWindowHeight, flags);
 #ifdef __EMSCRIPTEN__
     em_ui_callback_func onCanvasResize = [](int, const EmscriptenUiEvent*, void* userData) -> EM_BOOL {
@@ -486,6 +500,12 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         mCtx = SDL_GL_CreateContext(mWnd);
 
         SDL_GL_MakeCurrent(mWnd, mCtx);
+#ifdef __SWITCH__
+        if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress)) {
+            SPDLOG_CRITICAL("Failed to initialize Switch OpenGL functions");
+            std::abort();
+        }
+#endif
         SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
 
         window_impl.Opengl = { mWnd, mCtx };
@@ -713,6 +733,16 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
         }
     }
     switch (event.type) {
+#ifdef __SWITCH__
+        case SDL_CONTROLLERBUTTONDOWN:
+        case SDL_CONTROLLERBUTTONUP:
+            // ImGui disables gamepad navigation while the menu is closed. Feed
+            // Minus as Escape so the menu can always be reopened in that state.
+            if (event.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
+                ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, event.type == SDL_CONTROLLERBUTTONDOWN);
+            }
+            break;
+#endif
 #ifndef TARGET_WEB
         // Scancodes are broken in Emscripten SDL2: https://bugzilla.libsdl.org/show_bug.cgi?id=3259
         case SDL_KEYDOWN:
