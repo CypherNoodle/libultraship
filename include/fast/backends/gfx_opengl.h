@@ -139,6 +139,13 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     std::string BuildFsShader(const CCFeatures& cc_features);
     void SetPerDrawUniforms();
 
+    void ForgetBoundTexture() {
+        const int unit = mLastActiveTexture >= 0 ? mLastActiveTexture : 0;
+        if (unit < SHADER_MAX_TEXTURES) {
+            mLastBoundTextures[unit] = 0;
+        }
+    }
+
     std::vector<TextureInfo> textures;
     GLuint mCurrentTextureIds[SHADER_MAX_TEXTURES] = {};
     GLuint mLastBoundTextures[SHADER_MAX_TEXTURES] = {};
