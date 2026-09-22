@@ -10,6 +10,7 @@
 #include "ship/resource/archive/O2rArchive.h"
 #include "ship/resource/archive/FolderArchive.h"
 #include "ship/utils/StringHelper.h"
+#include "ship/utils/FilesystemPath.h"
 #include "ship/utils/glob.h"
 #include "ship/utils/StrHash64.h"
 
@@ -222,18 +223,18 @@ std::vector<std::string> ArchiveManager::GetArchiveListInPaths(const std::vector
                         StringHelper::IEquals(p.path().extension().string(), ".zip") ||
                         StringHelper::IEquals(p.path().extension().string(), ".mpq") ||
                         StringHelper::IEquals(p.path().extension().string(), ".o2r")) {
-                        fileList.push_back(std::filesystem::absolute(p).string());
+                        fileList.push_back(AbsolutePath(p.path()).string());
                         hasAssetFiles = true;
                     }
                 }
 
                 if (!hasAssetFiles) {
-                    fileList.push_back(std::filesystem::absolute(archivePath).string());
+                    fileList.push_back(AbsolutePath(archivePath).string());
                 }
             } else if (std::filesystem::is_regular_file(archivePath)) {
-                fileList.push_back(std::filesystem::absolute(archivePath).string());
+                fileList.push_back(AbsolutePath(archivePath).string());
             } else {
-                SPDLOG_WARN("The archive at path {} does not exist", std::filesystem::absolute(archivePath).string());
+                SPDLOG_WARN("The archive at path {} does not exist", AbsolutePath(archivePath).string());
             }
         } else {
             SPDLOG_WARN("No archive path supplied");

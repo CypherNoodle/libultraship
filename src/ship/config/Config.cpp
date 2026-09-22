@@ -194,6 +194,18 @@ void Config::Copy(const std::string& fromKey, const std::string& toKey) {
 }
 
 void Config::Reload() {
+#ifdef __SWITCH__
+    // Recover if a previous launch stopped between the two rename operations.
+    const fs::path backupPath(mPath + ".bak");
+    if (!fs::exists(mPath) && fs::exists(backupPath)) {
+        std::error_code restoreError;
+        fs::rename(backupPath, mPath, restoreError);
+        if (restoreError) {
+            SPDLOG_ERROR("Could not recover config {}: {}", mPath, restoreError.message());
+            throw fs::filesystem_error("Could not recover configuration", backupPath, fs::path(mPath), restoreError);
+        }
+    }
+#endif
     if (mPath == "None" || !fs::exists(mPath) || !fs::is_regular_file(mPath)) {
         mIsNewInstance = true;
         mFlattenedJson = nlohmann::json::object();
@@ -231,7 +243,35 @@ void Config::Save() {
             return;
         }
     }
+#ifdef __SWITCH__
+    // libnx rename does not replace an existing destination. Keep the previous
+    // config until the new file is installed, and recover it on failure/restart.
+    const fs::path backupPath(mPath + ".bak");
+    const bool hadConfig = fs::exists(configPath);
+    if (hadConfig) {
+        fs::remove(backupPath, ec);
+        if (!ec) {
+            fs::rename(configPath, backupPath, ec);
+        }
+        if (ec) {
+            SPDLOG_ERROR("Could not back up config {}: {}", mPath, ec.message());
+            return;
+        }
+    }
     fs::rename(tempPath, configPath, ec);
+    if (ec && hadConfig) {
+        std::error_code restoreError;
+        fs::rename(backupPath, configPath, restoreError);
+        if (restoreError) {
+            SPDLOG_ERROR("Config backup preserved at {}: {}", backupPath.string(), restoreError.message());
+        }
+    } else if (!ec && hadConfig) {
+        std::error_code removeError;
+        fs::remove(backupPath, removeError);
+    }
+#else
+    fs::rename(tempPath, configPath, ec);
+#endif
     if (ec) {
         SPDLOG_ERROR("Could not replace config \"{}\": {}", mPath, ec.message());
         std::error_code removeEc;
