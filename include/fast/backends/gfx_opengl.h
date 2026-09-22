@@ -155,7 +155,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     ShaderProgram* mLastLoadedShader = nullptr;
 
     GLuint mOpenglVbo = 0;
-#if defined(__APPLE__) || defined(USE_OPENGLES)
+#if defined(__APPLE__) || defined(USE_OPENGLES) || defined(__SWITCH__)
     GLuint mOpenglVao;
 #endif
 

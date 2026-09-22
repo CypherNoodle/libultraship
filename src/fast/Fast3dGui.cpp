@@ -219,7 +219,7 @@ void Fast3dGui::ImGuiBackendInit() {
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__SWITCH__)
             ImGui_ImplOpenGL3_Init("#version 410 core");
 #elif USE_OPENGLES
             ImGui_ImplOpenGL3_Init("#version 300 es");

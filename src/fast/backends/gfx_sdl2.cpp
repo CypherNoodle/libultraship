@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <cstdlib>
+#include <stdexcept>
 
 #include "fast/Fast3dWindow.h"
 
@@ -366,7 +367,14 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #endif
 
+#ifdef __SWITCH__
+    SPDLOG_INFO("Switch: initializing SDL video");
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        throw std::runtime_error(std::string("SDL video: ") + SDL_GetError());
+    }
+#else
     SDL_Init(SDL_INIT_VIDEO);
+#endif
 
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
 
@@ -395,9 +403,10 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
 #elif defined(__SWITCH__)
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    // Match the core shaders and VAO path used by the renderer.
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 #elif defined(USE_OPENGLES)
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -454,6 +463,12 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     flags = SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL;
 #endif
     mWnd = SDL_CreateWindow(title, posX, posY, mWindowWidth, mWindowHeight, flags);
+#ifdef __SWITCH__
+    if (mWnd == nullptr) {
+        throw std::runtime_error(std::string("SDL window: ") + SDL_GetError());
+    }
+    SPDLOG_INFO("Switch: SDL window created");
+#endif
 #ifdef __EMSCRIPTEN__
     em_ui_callback_func onCanvasResize = [](int, const EmscriptenUiEvent*, void* userData) -> EM_BOOL {
         auto backend = static_cast<GfxWindowBackendSDL2*>(userData);
@@ -498,12 +513,24 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         }
 
         mCtx = SDL_GL_CreateContext(mWnd);
-
+#ifdef __SWITCH__
+        if (mCtx == nullptr) {
+            throw std::runtime_error(std::string("SDL OpenGL context: ") + SDL_GetError());
+        }
+        if (SDL_GL_MakeCurrent(mWnd, mCtx) != 0) {
+            throw std::runtime_error(std::string("SDL OpenGL make current: ") + SDL_GetError());
+        }
+#else
         SDL_GL_MakeCurrent(mWnd, mCtx);
+#endif
 #ifdef __SWITCH__
         if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress)) {
-            SPDLOG_CRITICAL("Failed to initialize Switch OpenGL functions");
-            std::abort();
+            throw std::runtime_error("Failed to initialize Switch OpenGL functions");
+        }
+        SPDLOG_INFO("Switch: OpenGL {}, renderer {}, GLSL {}", (const char*)glGetString(GL_VERSION),
+                    (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_SHADING_LANGUAGE_VERSION));
+        if (!GLAD_GL_VERSION_4_1 || !glGenFramebuffers || !glGenRenderbuffers || !glGenVertexArrays) {
+            throw std::runtime_error("Switch renderer requires OpenGL 4.1 core functions");
         }
 #endif
         SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
