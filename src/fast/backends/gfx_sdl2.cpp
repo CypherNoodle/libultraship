@@ -368,7 +368,6 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
 #endif
 
 #ifdef __SWITCH__
-    SPDLOG_INFO("Switch: initializing SDL video");
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         throw std::runtime_error(std::string("SDL video: ") + SDL_GetError());
     }
@@ -467,7 +466,6 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     if (mWnd == nullptr) {
         throw std::runtime_error(std::string("SDL window: ") + SDL_GetError());
     }
-    SPDLOG_INFO("Switch: SDL window created");
 #endif
 #ifdef __EMSCRIPTEN__
     em_ui_callback_func onCanvasResize = [](int, const EmscriptenUiEvent*, void* userData) -> EM_BOOL {
@@ -527,8 +525,6 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress)) {
             throw std::runtime_error("Failed to initialize Switch OpenGL functions");
         }
-        SPDLOG_INFO("Switch: OpenGL {}, renderer {}, GLSL {}", (const char*)glGetString(GL_VERSION),
-                    (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_SHADING_LANGUAGE_VERSION));
         if (!GLAD_GL_VERSION_4_1 || !glGenFramebuffers || !glGenRenderbuffers || !glGenVertexArrays) {
             throw std::runtime_error("Switch renderer requires OpenGL 4.1 core functions");
         }
