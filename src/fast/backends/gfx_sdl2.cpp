@@ -25,6 +25,9 @@
 
 #if defined(__SWITCH__)
 #include <SDL2/SDL.h>
+#ifdef __SWITCH__
+#include <cstdlib>
+#endif
 #include <glad/glad.h>
 #elif FOR_WINDOWS
 #include <GL/glew.h>
@@ -380,6 +383,12 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
 
 #ifdef ENABLE_VULKAN
     bool use_vulkan = strcmp(gfxApiName, "Vulkan") == 0;
+#ifdef __SWITCH__
+    if (use_vulkan) {
+        // The Switch SDL video driver uses this to select its EGL-free path.
+        setenv("PAPERBOAT_NXVK_VULKAN", "1", 1);
+    }
+#endif
 #else
     constexpr bool use_vulkan = false;
 #endif
