@@ -42,7 +42,7 @@ Fast3dWindow::Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastM
 #endif
 #ifdef ENABLE_OPENGL
 #ifdef __SWITCH__
-    // Zink is the reliable default on Switch; native NXVK remains selectable in Graphics.
+    // Zink is the reliable default on Switch; native NXVK Vulkan remains selectable in Graphics.
     AddAvailableWindowBackend(WindowBackend::FAST3D_SDL_OPENGL);
 #endif
 #endif
