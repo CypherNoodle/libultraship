@@ -170,12 +170,7 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         auto logPath = GetPathRelativeToAppDirectory(("logs/" + GetName() + ".log"));
         auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(logPath, 1024 * 1024 * 10, 10);
         sinks.push_back(fileSink);
-#ifdef __SWITCH__
-        // Preserve the last startup message even when the process faults immediately.
-        mLogger = std::make_shared<spdlog::logger>(GetName(), sinks.begin(), sinks.end());
-        GetLogger()->set_level(releaseBuildLogLevel);
-        GetLogger()->flush_on(spdlog::level::trace);
-#elif defined(_DEBUG)
+#ifdef _DEBUG
         mLogger = std::make_shared<spdlog::logger>("multi_sink", sinks.begin(), sinks.end());
         GetLogger()->set_level(debugBuildLogLevel);
         GetLogger()->flush_on(spdlog::level::trace);
