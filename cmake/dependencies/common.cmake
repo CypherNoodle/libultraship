@@ -1,6 +1,8 @@
 include(FetchContent)
 
-find_package(OpenGL QUIET)
+if(NOT TARGET OpenGL::GL)
+    find_package(OpenGL QUIET)
+endif()
 
 #=================== ImGui ===================
 set(imgui_fixes_and_config_patch_file ${CMAKE_CURRENT_SOURCE_DIR}/cmake/dependencies/patches/imgui-fixes-and-config.patch)
