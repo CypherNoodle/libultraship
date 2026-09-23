@@ -460,7 +460,8 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     // A fixed 720p surface also works when docked; SDL handles presentation scaling.
     mWindowWidth = 1280;
     mWindowHeight = 720;
-    flags = SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL;
+    // The patched Switch SDL driver leaves plain windows to native Vulkan.
+    flags = SDL_WINDOW_SHOWN | (use_opengl ? SDL_WINDOW_OPENGL : 0);
 #endif
     mWnd = SDL_CreateWindow(title, posX, posY, mWindowWidth, mWindowHeight, flags);
 #ifdef __SWITCH__
@@ -542,7 +543,11 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         if (startFullScreen) {
             SetFullscreenImpl(true, false);
         }
+#ifdef __SWITCH__
+        SDL_GetWindowSize(mWnd, &mWindowWidth, &mWindowHeight);
+#else
         SDL_Vulkan_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
+#endif
         window_impl.Vulkan = { mWnd };
         window_impl.Backend = WindowBackend::FAST3D_SDL_VULKAN;
 #endif
@@ -927,6 +932,13 @@ void GfxWindowBackendSDL2::SyncFramerateWithTime() const {
 }
 
 void GfxWindowBackendSDL2::SwapBuffersBegin() {
+#ifdef __SWITCH__
+    if (!(SDL_GetWindowFlags(mWnd) & SDL_WINDOW_OPENGL)) {
+        // Vulkan presents through its swapchain; retain the original frame pacing.
+        SyncFramerateWithTime();
+        return;
+    }
+#endif
     bool nextVsyncEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_VSYNC_ENABLED, 1);
 
     if (mVsyncEnabled != nextVsyncEnabled) {

@@ -14,7 +14,11 @@
 #include "gfx_rendering_api.h"
 #include "../interpreter.h"
 
+#ifdef __SWITCH__
+#include <volk.h>
+#else
 #include <vulkan/vulkan.h>
+#endif
 #include <unordered_map>
 #include <vector>
 #include <map>

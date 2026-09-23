@@ -22,6 +22,18 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
+#ifdef __SWITCH__
+#include <switch.h>
+extern "C" PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance, const char*);
+static void InitializeSwitchVulkanLoader() {
+    static const bool initialized = [] {
+        volkInitializeCustom(vk_icdGetInstanceProcAddr);
+        return true;
+    }();
+    (void)initialized;
+}
+#endif
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
@@ -37,11 +49,27 @@
 #include "ship/resource/factory/ShaderFactory.h"
 #include <sstream>
 
+static void GetVulkanDrawableSize(SDL_Window* window, int* width, int* height) {
+#ifdef __SWITCH__
+    SDL_GetWindowSize(window, width, height);
+#else
+    SDL_Vulkan_GetDrawableSize(window, width, height);
+#endif
+}
+
+static void HandleVulkanFailure(VkResult result) {
+#ifdef __SWITCH__
+    // Do not continue with uninitialized GPU handles after a failed allocation.
+    throw std::runtime_error("Switch Vulkan operation failed: " + std::to_string(result));
+#endif
+}
+
 #define VK_CHECK(expr)                                                          \
     do {                                                                        \
         VkResult _res = (expr);                                                 \
         if (_res != VK_SUCCESS) {                                               \
             SPDLOG_ERROR("Vulkan error {} at {}: " #expr, (int)_res, __LINE__); \
+            HandleVulkanFailure(_res);                                         \
         }                                                                       \
     } while (0)
 
@@ -757,10 +785,15 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
     mWindow = window;
 
     // Instance
+#ifdef __SWITCH__
+    InitializeSwitchVulkanLoader();
+    std::vector<const char*> instanceExts = { VK_KHR_SURFACE_EXTENSION_NAME, VK_NN_VI_SURFACE_EXTENSION_NAME };
+#else
     uint32_t sdlExtCount = 0;
     SDL_Vulkan_GetInstanceExtensions(window, &sdlExtCount, nullptr);
     std::vector<const char*> instanceExts(sdlExtCount);
     SDL_Vulkan_GetInstanceExtensions(window, &sdlExtCount, instanceExts.data());
+#endif
 
     uint32_t availExtCount = 0;
     vkEnumerateInstanceExtensionProperties(nullptr, &availExtCount, nullptr);
@@ -792,10 +825,24 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
         return false;
     }
 
+#ifdef __SWITCH__
+    volkLoadInstance(mInstance);
+    int width = 0, height = 0;
+    SDL_GetWindowSize(window, &width, &height);
+    if (R_FAILED(nwindowSetDimensions(nwindowGetDefault(), width, height))) {
+        throw std::runtime_error("Vulkan: failed to size the Switch native window");
+    }
+    VkViSurfaceCreateInfoNN surfaceInfo = { VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN };
+    surfaceInfo.window = nwindowGetDefault();
+    if (!vkCreateViSurfaceNN || vkCreateViSurfaceNN(mInstance, &surfaceInfo, nullptr, &mSurface) != VK_SUCCESS) {
+        throw std::runtime_error("Vulkan: failed to create Switch VI surface");
+    }
+#else
     if (!SDL_Vulkan_CreateSurface(window, mInstance, &mSurface)) {
         SPDLOG_ERROR("Vulkan: SDL_Vulkan_CreateSurface failed: {}", SDL_GetError());
         return false;
     }
+#endif
 
     // Physical device + queue family with graphics & present
     uint32_t devCount = 0;
@@ -873,6 +920,12 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
         SPDLOG_ERROR("Vulkan: vkCreateDevice failed");
         return false;
     }
+#ifdef __SWITCH__
+    volkLoadDevice(mDevice);
+    VkPhysicalDeviceProperties deviceProperties {};
+    vkGetPhysicalDeviceProperties(mPhysicalDevice, &deviceProperties);
+    SPDLOG_INFO("Switch native Vulkan: {}", deviceProperties.deviceName);
+#endif
     vkGetDeviceQueue(mDevice, mQueueFamily, 0, &mQueue);
 
     // Descriptor set layouts + pipeline layout
@@ -990,7 +1043,7 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
 
     // Initial swapchain
     int dw = 0, dh = 0;
-    SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+    GetVulkanDrawableSize(window, &dw, &dh);
     CreateSwapchain((uint32_t)dw, (uint32_t)dh);
 
     // ImGui
@@ -1090,7 +1143,7 @@ void GfxRenderingAPIVK::NewFrame() {
 
     // Swapchain housekeeping
     int dw = 0, dh = 0;
-    SDL_Vulkan_GetDrawableSize(mWindow, &dw, &dh);
+    GetVulkanDrawableSize(mWindow, &dw, &dh);
     if (mSwapchainNeedsRecreate || (uint32_t)dw != mSwapchainExtent.width || (uint32_t)dh != mSwapchainExtent.height) {
         CreateSwapchain((uint32_t)dw, (uint32_t)dh);
     }
@@ -2407,6 +2460,10 @@ FilteringMode GfxRenderingAPIVK::GetTextureFilter() {
 } // namespace Fast
 
 bool Vulkan_IsSupported() {
+#ifdef __SWITCH__
+    InitializeSwitchVulkanLoader();
+    return vkCreateInstance && vkEnumerateInstanceExtensionProperties;
+#else
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         return false;
     }
@@ -2414,6 +2471,7 @@ bool Vulkan_IsSupported() {
         return false;
     }
     return true;
+#endif
 }
 
 #endif

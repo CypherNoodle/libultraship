@@ -1,0 +1,18 @@
+set(SWITCH_VULKAN_DEPS "" CACHE PATH "Prepared Switch shaderc and volk checkout")
+if(NOT EXISTS "${SWITCH_VULKAN_DEPS}/shaderc-build/libshaderc/libshaderc_combined.a")
+    message(FATAL_ERROR "Build the Switch shaderc dependencies before enabling native Vulkan")
+endif()
+add_library(lus_switch_volk STATIC "${SWITCH_VULKAN_DEPS}/volk/volk.c")
+target_include_directories(lus_switch_volk PUBLIC "${SWITCH_VULKAN_DEPS}/volk")
+target_compile_definitions(lus_switch_volk PUBLIC VK_NO_PROTOTYPES VK_USE_PLATFORM_VI_NN)
+target_link_libraries(lus_switch_volk PUBLIC lus_switch_nxvk)
+add_library(Vulkan::Vulkan ALIAS lus_switch_volk)
+add_library(Vulkan::shaderc_combined STATIC IMPORTED GLOBAL)
+set_target_properties(Vulkan::shaderc_combined PROPERTIES
+    IMPORTED_LOCATION "${SWITCH_VULKAN_DEPS}/shaderc-build/libshaderc/libshaderc_combined.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${SWITCH_VULKAN_DEPS}/shaderc/libshaderc/include")
+set(LUS_ENABLE_VULKAN ON CACHE INTERNAL "Vulkan backend available" FORCE)
+target_sources(ImGui PRIVATE ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+target_compile_definitions(ImGui PUBLIC IMGUI_IMPL_VULKAN_USE_VOLK)
+target_link_libraries(ImGui PUBLIC Vulkan::Vulkan)
+message(STATUS "Switch native Vulkan and Zink backends enabled")

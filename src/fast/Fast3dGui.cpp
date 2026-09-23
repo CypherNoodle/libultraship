@@ -1,6 +1,7 @@
 #include "fast/Fast3dGui.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 #include "fast/Fast3dWindow.h"
 #include "ship/Context.h"
@@ -170,7 +171,11 @@ void Fast3dGui::ImGuiWMInit() {
             if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_ALLOW_BACKGROUND_INPUTS, 1)) {
                 SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
             }
+#ifdef __SWITCH__
+            ImGui_ImplSDL2_InitForOther(static_cast<SDL_Window*>(mImpl.Vulkan.Window));
+#else
             ImGui_ImplSDL2_InitForVulkan(static_cast<SDL_Window*>(mImpl.Vulkan.Window));
+#endif
             break;
 #endif
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
@@ -240,7 +245,9 @@ void Fast3dGui::ImGuiBackendInit() {
 #ifdef ENABLE_VULKAN
         case WindowBackend::FAST3D_SDL_VULKAN: {
             GfxRenderingAPIVK* api = (GfxRenderingAPIVK*)mInterpreter.lock()->GetCurrentRenderingAPI();
-            api->VulkanInit(static_cast<SDL_Window*>(mImpl.Vulkan.Window));
+            if (!api->VulkanInit(static_cast<SDL_Window*>(mImpl.Vulkan.Window))) {
+                throw std::runtime_error("Failed to initialize Vulkan renderer");
+            }
             break;
         }
 #endif
