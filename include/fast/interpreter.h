@@ -14,6 +14,7 @@
 #include <string_view>
 #include <memory>
 #include <future>
+#include <functional>
 #include <chrono>
 #include <unordered_set>
 
@@ -219,7 +220,10 @@ struct TextureCacheKey {
     uint8_t mip_levels;
     // 1 = uploaded as a CI index texture (palette applied in the shader). Indexed
     // entries do not key on palette contents, which is what makes TLUT swaps free.
+    // 2 = the HD replacement's silhouette as indices (see gDPPaletteMask); mask[] are
+    // the entries its opaque and transparent pixels read.
     uint8_t indexed;
+    uint8_t mask[2];
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
 
@@ -545,6 +549,7 @@ class Interpreter {
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
     void TextureCacheDeleteByPalette(const uint8_t* palAddr);
+    void TextureCacheDrop(int i);
     void ImportTextureRgba16(int tile, bool importReplacement);
     void ImportTextureRgba32(int tile, bool importReplacement);
     void ImportTextureIA4(int tile, bool importReplacement);
@@ -564,7 +569,12 @@ class Interpreter {
     void UploadBaseTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height);
     void UploadMipChain(uint32_t baseTile);
     // Box-filter downsample one RGBA32 level into the next (halved, min 1px).
-    static void BoxDownsampleRgba32(const uint8_t* src, uint32_t srcW, uint32_t srcH, uint8_t* dst);
+    static void BoxDownsampleRgba32(const uint8_t* src, uint32_t srcW, uint32_t srcH, uint8_t* dst,
+                                    uint32_t threads = 1);
+    static uint32_t MipLevelCount(uint32_t width, uint32_t height);
+    // Build every mip level of an RGBA32 image. Safe to call from any thread.
+    static void BuildMipChain(const uint8_t* rgba32Buf, uint32_t width, uint32_t height,
+                              std::vector<Fast::Texture::MipLevel>& levels, uint32_t threads = 1);
     const RDP::TmemLoadEntry* FindTmemLoad(uint16_t tmemWord) const;
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
     // Opt-in memoization of OTR texture-path resolution, keyed by display-list
@@ -698,6 +708,9 @@ class Interpreter {
     // The import in progress is an HD (upscaled) texture. Auto-generated mipmaps
     // are only built for these; original low-res N64 textures upload single-level.
     bool mImportIsHd = false;
+    // The tile being imported, and whether it has uploaded to its cache entry yet
+    int mImportTile = 0;
+    bool mImportUploaded = false;
     // Palette textures are versioned by TLUT content and never mutated once
     // uploaded: backends queue draw commands (Metal executes at end of frame),
     // so rewriting a bound palette would retroactively recolor earlier draws.
@@ -716,8 +729,8 @@ class Interpreter {
     // Per-draw palette parameters: x = palette bank entry offset, y = filter mode
     float mPaletteParams[2][4]{};
     uint8_t* mTexUploadBuffer = nullptr;
-    // Ping-pong scratch buffers for CPU-generated mip levels (auto mipmapping)
-    std::vector<uint8_t> mMipScratch[2];
+    // Mip chain built on the frame when the resource has none
+    std::vector<Fast::Texture::MipLevel> mMipChainScratch;
 
     GfxDimensions mGfxCurrentWindowDimensions{}; // gfx_current_window_dimensions;
     int32_t mCurWindowPosX{};
@@ -837,11 +850,41 @@ class Interpreter {
     // Textures whose HD version has already been swapped in (uploaded once, now cache-resident);
     // they bypass the per-frame swap budget so they never flicker back to vanilla.
     std::unordered_set<std::string> mTexSwappedIn;
+    std::unordered_set<std::string> mTexPrefetched; // prefix groups already queued
+    // Port-supplied: the group prefix to prefetch when a replacement is first requested
+    std::function<std::string(const std::string&)> mReplacementGroupOf;
+    std::vector<std::string> mAltFiles;             // every replacement in the archives, sorted
+    bool mAltFilesListed = false;
     // Resource path of the TLUT in each CI4 bank (CI8 uses bank 0), empty when it was
     // loaded from a raw pointer. Names the "alt/<raster>@<palette>" replacement variant.
     std::string mTlutPath[16];
     std::shared_ptr<Fast::Texture> ResolvePaletteVariant(const RawTexMetadata* metadata, int tile);
+    std::shared_ptr<Fast::Texture> LoadPaletteVariant(const RawTexMetadata* metadata, const std::string& tlut);
     bool TilePaletteIsNamed(int tile) const;
+    // What the game says a palette it built at run time is (gDPPaletteBlend, gDPPaletteMask),
+    // by the address it lives at, for the frame it said so. A bank keeps a copy alongside
+    // mTlutPath while that palette is loaded in it.
+    struct PaletteBlend {
+        std::string from, to; // empty when the palette is not a lerp
+        uint8_t alpha = 0;
+        uint32_t frame = 0;
+    };
+    struct PaletteMask {
+        int16_t opaque = -1; // the entries opaque and transparent texels read; -1 when not a mask
+        int16_t transparent = -1;
+        uint32_t frame = 0;
+    };
+    // Vanilla texture behind each replacement, for tiles drawn through a run-time palette
+    mutable std::unordered_map<Fast::Texture*, std::shared_ptr<Fast::Texture>> mVanillaTextures;
+    std::unordered_map<const uint8_t*, PaletteBlend> mPaletteBlends;
+    std::unordered_map<const uint8_t*, PaletteMask> mPaletteMasks;
+    PaletteBlend mTlutBlend[16];
+    PaletteMask mTlutMask[16];
+    std::vector<uint8_t> mPaletteBlendBuffer;
+    void SetPaletteBlend(const uint8_t* palette, const char* from, const char* to, uint8_t alpha);
+    void SetPaletteMask(const uint8_t* palette, uint8_t opaque, uint8_t transparent);
+    const uint8_t* BlendPaletteVariants(const RawTexMetadata* metadata, int tile);
+    const PaletteMask* TilePaletteMask(int tile) const;
     uint32_t mMipBaseWidth = 0, mMipBaseHeight = 0; // level-0 upload size of the current chain
     std::vector<uint8_t> mMipLevelBuffer;
     std::vector<uint8_t> mMipBaseCopy;
@@ -852,6 +895,8 @@ class Interpreter {
         uint32_t lineBytes;   // raster bytes per loaded row
         uint32_t rows;
         uint32_t strideBytes; // raster bytes per row of the whole image
+        uint32_t width;       // texels to upload, clipped to the raster and the tile
+        uint32_t height;
     };
     bool HasHdReplacement(const RawTexMetadata* metadata) const;
     bool TileRasterRegion(int tile, RasterRegion& region) const;
@@ -861,6 +906,10 @@ class Interpreter {
     // otherwise the vanilla fallback (kicking the async load on first reference). Falls back
     // to a plain cached load when async is disabled or alt assets are off.
     std::shared_ptr<Ship::IResource> AcquireDrawTexture(const char* name);
+    bool ReplacementFits(const std::shared_ptr<Ship::IResource>& res, const std::string& name);
+    void PrefetchReplacementGroup(const std::string& group);
+    void SetReplacementGroupResolver(std::function<std::string(const std::string&)> groupOf);
+    void SyncAltAssetState();
 };
 
 void gfx_set_target_ucode(UcodeHandlers ucode);

@@ -202,6 +202,8 @@
 #define G_SET_STRICT_DECAL 0x4b
 #define G_SETUNIFORM 0x4c
 #define G_SETTILESCROLL_INTERP 0x4d
+#define G_PAL_BLEND 0x4e
+#define G_PAL_MASK 0x4f
 
 /*
  * The following commands are the "generated" RDP commands; the user
@@ -2835,6 +2837,29 @@ typedef union Gfx {
         Gfx* _g = (Gfx*)(pkt);                             \
         _g->words.w0 = _SHIFTL(G_INVAL_TEX_BY_PAL, 24, 8); \
         _g->words.w1 = (uintptr_t)(palAddr);               \
+    }
+
+// What a palette the game built at run time is, so HD art drawn through it can follow.
+// Emit each frame the palette is drawn, before its TLUT load.
+
+// A lerp from palette resource `from` to `to` by alpha (0-255): the HD art for each end
+// is mixed the same way. Two Gfx.
+#define gDPPaletteBlend(pkt, palAddr, from, to, alpha)                        \
+    {                                                                         \
+        Gfx *_g0 = (Gfx*)(pkt), *_g1 = (Gfx*)(pkt);                           \
+        _g0->words.w0 = _SHIFTL(G_PAL_BLEND, 24, 8) | _SHIFTL((alpha), 0, 8); \
+        _g0->words.w1 = (uintptr_t)(palAddr);                                 \
+        _g1->words.w0 = (uintptr_t)(from);                                    \
+        _g1->words.w1 = (uintptr_t)(to);                                      \
+    }
+
+// A mask: every opaque texel of the raster reads entry `opaque` and every transparent
+// one entry `transparent`, so HD art drawn through it is its own silhouette.
+#define gDPPaletteMask(pkt, palAddr, opaque, transparent)                                                   \
+    {                                                                                                       \
+        Gfx* _g = (Gfx*)(pkt);                                                                              \
+        _g->words.w0 = _SHIFTL(G_PAL_MASK, 24, 8) | _SHIFTL((opaque), 8, 8) | _SHIFTL((transparent), 0, 8); \
+        _g->words.w1 = (uintptr_t)(palAddr);                                                                \
     }
 
 // Toggles strict (depth-equal) decal compare for subsequent ZMODE_DEC draws,

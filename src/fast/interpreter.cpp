@@ -19,6 +19,9 @@
 #include <list>
 #include <stack>
 #include <chrono>
+#include <thread>
+#include <array>
+#include <algorithm>
 #include "fast/resource/type/Light.h"
 
 #ifndef _LANGUAGE_C
@@ -772,6 +775,7 @@ void Interpreter::TextureCacheClear() {
     mTextureCache.lru.clear();
     mResolvedResourceCache.clear();
     mDrawTextureCache.clear();
+    mVanillaTextures.clear();
     mAltMissing.clear();
     // Drop async texture futures too — they hold shared_ptrs to resources that an
     // alt-asset toggle (which calls gfx_texture_cache_clear) has just invalidated.
@@ -788,19 +792,99 @@ void Interpreter::ShaderCacheClear() {
     mRapi->ClearShaderCache();
 }
 
-std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* name) {
-    auto rm = Ship::Context::GetRawInstance()->GetResourceManager();
-    const bool altEnabled = rm->IsAltAssetsEnabled();
+// If a replacement is too big, draw the original and warn.
+bool Interpreter::ReplacementFits(const std::shared_ptr<Ship::IResource>& res, const std::string& name) {
+    const auto tex = std::dynamic_pointer_cast<Fast::Texture>(res);
+    if (tex == nullptr) {
+        return true;
+    }
+    const uint32_t max = (uint32_t)mRapi->GetMaxTextureSize();
+    if (tex->Width <= max && tex->Height <= max) {
+        return true;
+    }
+    SPDLOG_WARN("{} is {}x{}, over this GPU's {} texture limit; drawing the original", name, tex->Width, tex->Height,
+                max);
+    return false;
+}
 
-    // Alt assets decide every resolution below, so a runtime toggle drops what was
-    // remembered here (and the settled async decisions along with it).
+// Decode every replacement under a path prefix on the thread pool before it is drawn.
+// Without this the first draw stalls on the load, or shows the original until the load
+// lands when loads are asynchronous.
+void Interpreter::PrefetchReplacementGroup(const std::string& group) {
+    SyncAltAssetState();
+    if (group.empty() || !mTexPrefetched.insert(group).second) {
+        return;
+    }
+    auto rm = Ship::Context::GetRawInstance()->GetResourceManager();
+    if (!rm->IsAltAssetsEnabled()) {
+        return;
+    }
+    if (!mAltFilesListed) {
+        mAltFilesListed = true;
+        if (auto files = rm->GetArchiveManager()->ListFiles(Ship::IResource::gAltAssetPrefix + "*")) {
+            mAltFiles = std::move(*files);
+            std::sort(mAltFiles.begin(), mAltFiles.end());
+        }
+    }
+    const std::string prefix = Ship::IResource::gAltAssetPrefix + group;
+    size_t queued = 0;
+    for (auto it = std::lower_bound(mAltFiles.begin(), mAltFiles.end(), prefix);
+         it != mAltFiles.end() && it->compare(0, prefix.size(), prefix) == 0; ++it) {
+        const std::string base = it->substr(Ship::IResource::gAltAssetPrefix.length());
+        if (base.find('@') != std::string::npos || mTexFutures.count(base) != 0) {
+            continue;
+        }
+        if (!mAutoMipmapsEnabled) {
+            mTexFutures[base] = rm->LoadResourceAsync(*it, /*loadExact=*/true, BS::pr::lowest);
+        } else {
+            mTexFutures[base] =
+                rm->GetThreadPool()
+                    ->submit_task(
+                        [rm, file = *it]() -> std::shared_ptr<Ship::IResource> {
+                            auto res = rm->LoadResourceProcess(file, /*loadExact=*/true);
+                            auto tex = std::dynamic_pointer_cast<Fast::Texture>(res);
+                            if (tex != nullptr && tex->Type == Fast::TextureType::RGBA32bpp &&
+                                tex->ImageData != nullptr && MipLevelCount(tex->Width, tex->Height) > 1 &&
+                                !tex->MipsBuilding.exchange(true)) {
+                                BuildMipChain(tex->ImageData, tex->Width, tex->Height, tex->Mips);
+                                tex->MipsReady.store(true, std::memory_order_release);
+                            }
+                            return res;
+                        },
+                        BS::pr::lowest)
+                    .share();
+        }
+        if (++queued >= 1024) {
+            break;
+        }
+    }
+}
+
+// Toggling alt assets invalidates everything AcquireDrawTexture remembered, including
+// settled async loads.
+void Interpreter::SyncAltAssetState() {
+    const bool altEnabled = Ship::Context::GetRawInstance()->GetResourceManager()->IsAltAssetsEnabled();
     if (mDrawTextureCacheAltAssets != (int8_t)altEnabled) {
         mDrawTextureCache.clear();
         mAltMissing.clear();
         mTexFutures.clear();
         mTexSwappedIn.clear();
+        mTexPrefetched.clear();
+        mAltFiles.clear();
+        mAltFilesListed = false;
         mDrawTextureCacheAltAssets = (int8_t)altEnabled;
     }
+}
+
+// Hand off to ports to decide which replacements draw together.
+void Interpreter::SetReplacementGroupResolver(std::function<std::string(const std::string&)> groupOf) {
+    mReplacementGroupOf = std::move(groupOf);
+}
+
+std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* name) {
+    auto rm = Ship::Context::GetRawInstance()->GetResourceManager();
+    const bool altEnabled = rm->IsAltAssetsEnabled();
+    SyncAltAssetState();
 
     // Texture binds ask for the same paths every frame, and the answer only changes when
     // an async load settles or alt assets are toggled. Memoize the settled resource per
@@ -848,9 +932,13 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
 
     const std::string altName = Ship::IResource::gAltAssetPrefix + nameStr;
 
+    if (mReplacementGroupOf) {
+        PrefetchReplacementGroup(mReplacementGroupOf(nameStr));
+    }
+
     // Synchronous (async loading off): try the HD path, fall back to vanilla when absent.
     if (!mAsyncTextureLoad) {
-        if (auto hd = rm->LoadResource(altName, /*loadExact=*/true)) {
+        if (auto hd = rm->LoadResource(altName, /*loadExact=*/true); hd && ReplacementFits(hd, altName)) {
             return settled(hd);
         }
         mAltMissing.insert(nameStr);
@@ -892,6 +980,11 @@ std::shared_ptr<Ship::IResource> Interpreter::AcquireDrawTexture(const char* nam
             // keep showing vanilla and try again next frame (so this one is not remembered).
             if (mReplacementUploadBudget > 0 && mFrameReplacementUploads >= mReplacementUploadBudget) {
                 return rm->LoadResource(name, /*loadExact=*/true);
+            }
+            if (!ReplacementFits(res, altName)) {
+                mTexSwappedIn.insert(nameStr);
+                mAltMissing.insert(nameStr);
+                return settled(rm->LoadResource(name, /*loadExact=*/true));
             }
             mFrameReplacementUploads++;
             mTexSwappedIn.insert(nameStr);
@@ -969,8 +1062,15 @@ std::shared_ptr<Fast::Texture> Interpreter::ResolvePaletteVariant(const RawTexMe
     if (tlut.empty()) {
         return nullptr;
     }
+    return LoadPaletteVariant(metadata, tlut);
+}
+
+// "alt/<raster>@<palette basename>", when the pack has it at the raster's own size.
+std::shared_ptr<Fast::Texture> Interpreter::LoadPaletteVariant(const RawTexMetadata* metadata,
+                                                               const std::string& tlut) {
     const size_t slash = tlut.find_last_of('/');
-    const std::string variantPath = path + "@" + (slash == std::string::npos ? tlut : tlut.substr(slash + 1));
+    const std::string variantPath =
+        metadata->resource->GetInitData()->Path + "@" + (slash == std::string::npos ? tlut : tlut.substr(slash + 1));
     const auto t0 = std::chrono::steady_clock::now();
     auto variant =
         std::static_pointer_cast<Fast::Texture>(Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(variantPath, /*loadExact=*/true));
@@ -979,10 +1079,73 @@ std::shared_ptr<Fast::Texture> Interpreter::ResolvePaletteVariant(const RawTexMe
         SPDLOG_INFO("variant load {} took {} ms", variantPath, ms);
     }
     if (variant == nullptr || variant->Width != metadata->width || variant->Height != metadata->height ||
-        variant->Type != metadata->type) {
+        variant->Type != metadata->type || variant->ImageDataSize != metadata->resource->ImageDataSize) {
         return nullptr;
     }
     return variant;
+}
+
+// The HD art for a tile drawn through a palette the game lerps between two named ones:
+// each end's variant (the base where the pack has none) mixed by the same alpha. nullptr
+// when the tile is not drawn through such a palette, or both ends are the base.
+const uint8_t* Interpreter::BlendPaletteVariants(const RawTexMetadata* metadata, int tile) {
+    const auto& tt = mRdp->texture_tile[tile];
+    if (tt.fmt != G_IM_FMT_CI || (tt.siz != G_IM_SIZ_4b && tt.siz != G_IM_SIZ_8b)) {
+        return nullptr;
+    }
+    const PaletteBlend& blend = mTlutBlend[tt.siz == G_IM_SIZ_4b ? (tt.palette & 15) : 0];
+    if (blend.to.empty() || !HasHdReplacement(metadata)) {
+        return nullptr;
+    }
+    const auto from = LoadPaletteVariant(metadata, blend.from);
+    const auto to = LoadPaletteVariant(metadata, blend.to);
+    const uint8_t* a = from != nullptr ? from->ImageData : metadata->resource->ImageData;
+    const uint8_t* b = to != nullptr ? to->ImageData : metadata->resource->ImageData;
+    if (a == b) {
+        return nullptr;
+    }
+    if (blend.alpha == 0) {
+        return a;
+    }
+    if (blend.alpha == 255) {
+        return b;
+    }
+    const size_t size = metadata->resource->ImageDataSize;
+    mPaletteBlendBuffer.resize(size);
+    for (size_t i = 0; i < size; i++) {
+        mPaletteBlendBuffer[i] = (uint8_t)((a[i] * (255 - blend.alpha) + b[i] * blend.alpha) / 255);
+    }
+    return mPaletteBlendBuffer.data();
+}
+
+// Records the lerp for the frame; the TLUT load of that palette picks it up. Its
+// colors move with the alpha, so what was drawn through it before is dropped.
+void Interpreter::SetPaletteBlend(const uint8_t* palette, const char* from, const char* to, uint8_t alpha) {
+    PaletteBlend& blend = mPaletteBlends[palette];
+    if (blend.alpha != alpha || blend.from != from || blend.to != to) {
+        TextureCacheDeleteByPalette(palette);
+        blend.from = from;
+        blend.to = to;
+        blend.alpha = alpha;
+    }
+    blend.frame = mCustomFrameCount;
+}
+
+void Interpreter::SetPaletteMask(const uint8_t* palette, uint8_t opaque, uint8_t transparent) {
+    mPaletteMasks[palette] = { opaque, transparent, mCustomFrameCount };
+}
+
+// The mask a CI tile with an HD replacement reads through, or nullptr.
+const Interpreter::PaletteMask* Interpreter::TilePaletteMask(int tile) const {
+    const auto& tt = mRdp->texture_tile[tile];
+    if (tt.fmt != G_IM_FMT_CI || (tt.siz != G_IM_SIZ_4b && tt.siz != G_IM_SIZ_8b)) {
+        return nullptr;
+    }
+    const PaletteMask& mask = mTlutMask[tt.siz == G_IM_SIZ_4b ? (tt.palette & 15) : 0];
+    if (mask.opaque < 0 || !HasHdReplacement(&mRdp->loaded_texture[tt.tmem_index].raw_tex_metadata)) {
+        return nullptr;
+    }
+    return &mask;
 }
 
 bool Interpreter::TilePaletteIsNamed(int tile) const {
@@ -990,7 +1153,11 @@ bool Interpreter::TilePaletteIsNamed(int tile) const {
     if (tt.fmt != G_IM_FMT_CI) {
         return true;
     }
-    return !mTlutPath[tt.siz == G_IM_SIZ_4b ? (tt.palette & 15) : 0].empty();
+    const int bank = tt.siz == G_IM_SIZ_4b ? (tt.palette & 15) : 0;
+    // A lerp between two named palettes counts as named for HD art (mixed from each
+    // end's variant) and not for N64 texels (drawn through the lerp itself).
+    return !mTlutPath[bank].empty() ||
+           (!mTlutBlend[bank].to.empty() && HasHdReplacement(&mRdp->loaded_texture[tt.tmem_index].raw_tex_metadata));
 }
 
 std::string_view Interpreter::GetBaseTexturePath(std::string_view path) {
@@ -1044,6 +1211,19 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
             break;
         }
     }
+}
+
+// Drop the entry bound to a shader slot before anything uploaded to it. Nothing drew
+// with its id, so it goes straight back to the free list.
+void Interpreter::TextureCacheDrop(int i) {
+    TextureCacheNode* node = mRenderingState.mTextures[i];
+    if (node == nullptr) {
+        return;
+    }
+    mTextureCache.free_texture_ids.push_back(node->second.texture_id);
+    mTextureCache.lru.erase(node->second.lru_location);
+    mTextureCache.map.erase(node->first);
+    mRenderingState.mTextures[i] = nullptr;
 }
 
 // Invalidate cache entries whose key references the given palette DRAM addr.
@@ -1705,7 +1885,8 @@ bool Interpreter::TileRasterRegion(int tile, RasterRegion& region) const {
 
 // The vanilla texture behind a replacement, for a tile that reads it through a palette the
 // game built at run time. The draw path and the upload both ask, so they cannot disagree
-// about whether the shader does the palette lookup.
+// about whether the shader does the palette lookup. The region comes back sized for the
+// upload.
 std::shared_ptr<Fast::Texture> Interpreter::VanillaCiSource(int tile, RasterRegion& region) const {
     const auto& tt = mRdp->texture_tile[tile];
     const auto& loaded = mRdp->loaded_texture[tt.tmem_index];
@@ -1714,12 +1895,36 @@ std::shared_ptr<Fast::Texture> Interpreter::VanillaCiSource(int tile, RasterRegi
         !TileRasterRegion(tile, region)) {
         return nullptr;
     }
-    auto base = std::static_pointer_cast<Fast::Texture>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(
-            std::string(GetBaseTexturePath(loaded.raw_tex_metadata.resource->GetInitData()->Path)),
-            /*loadExact=*/true));
+    Fast::Texture* hd = loaded.raw_tex_metadata.resource.get();
+    auto found = mVanillaTextures.find(hd);
+    if (found == mVanillaTextures.end()) {
+        auto base =
+            std::static_pointer_cast<Fast::Texture>(Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(
+                std::string(GetBaseTexturePath(hd->GetInitData()->Path)), /*loadExact=*/true));
+        found = mVanillaTextures.emplace(hd, std::move(base)).first;
+    }
+    const auto& base = found->second;
     if (base == nullptr || base->ImageData == nullptr ||
         base->Type != (tt.siz == G_IM_SIZ_4b ? Fast::TextureType::Palette4bpp : Fast::TextureType::Palette8bpp)) {
+        return nullptr;
+    }
+    region.width = tt.siz == G_IM_SIZ_4b ? region.lineBytes * 2 : region.lineBytes;
+    region.height = region.rows;
+    const size_t start = (size_t)region.y * region.strideBytes + region.xBytes;
+    while (region.height > 0 &&
+           start + (size_t)(region.height - 1) * region.strideBytes + region.lineBytes > base->ImageDataSize) {
+        region.height--;
+    }
+    // Replacements clamp to the rendered tile region (see ImportTextureCi4); match it.
+    const uint32_t tileW = TileWidthPx(mRdp, tile);
+    const uint32_t tileH = TileHeightPx(mRdp, tile);
+    if (tileW > 0 && tileW < region.width) {
+        region.width = tileW;
+    }
+    if (tileH > 0 && tileH < region.height) {
+        region.height = tileH;
+    }
+    if (region.width == 0 || region.height == 0) {
         return nullptr;
     }
     return base;
@@ -1737,26 +1942,42 @@ bool Interpreter::UploadVanillaCi(int tile) {
     if (base == nullptr) {
         return false;
     }
-    uint32_t width = tt.siz == G_IM_SIZ_4b ? region.lineBytes * 2 : region.lineBytes;
-    uint32_t height = region.rows;
+    uint32_t width = region.width;
+    uint32_t height = region.height;
     const size_t start = (size_t)region.y * region.strideBytes + region.xBytes;
-    while (height > 0 && start + (size_t)(height - 1) * region.strideBytes + region.lineBytes > base->ImageDataSize) {
-        height--;
-    }
-    // Replacements clamp to the rendered tile region (see ImportTextureCi4); match it.
-    const uint32_t tileW = TileWidthPx(mRdp, tile);
-    const uint32_t tileH = TileHeightPx(mRdp, tile);
-    if (tileW > 0 && tileW < width) {
-        width = tileW;
-    }
-    if (tileH > 0 && tileH < height) {
-        height = tileH;
-    }
-    if (width == 0 || height == 0) {
-        return false;
-    }
     const uint8_t* src = base->ImageData + start;
-    if (mImportIndexed) {
+    const PaletteMask* mask = mImportIndexed ? TilePaletteMask(tile) : nullptr;
+    if (mask != nullptr) {
+        // The replacement's own silhouette, as indices: the mask then lines up with the HD
+        // art it is drawn over, and still costs no upload when the tones change.
+        const RawTexMetadata& meta = mRdp->loaded_texture[tt.tmem_index].raw_tex_metadata;
+        const uint32_t texelsPerByte = tt.siz == G_IM_SIZ_4b ? 2 : 1;
+        // replacement pixels per texel: h_byte_scale is in bytes, and a pixel is four
+        const uint32_t xScale = (uint32_t)std::lround(meta.h_byte_scale) / (4 * texelsPerByte);
+        const uint32_t yScale = (uint32_t)std::lround(meta.v_pixel_scale);
+        const uint32_t stride = region.strideBytes * texelsPerByte * xScale;
+        const uint8_t* hd = meta.resource->ImageData +
+                            ((size_t)region.y * yScale * stride + region.xBytes * texelsPerByte * xScale) * 4;
+        const uint8_t* end = meta.resource->ImageData + meta.resource->ImageDataSize;
+        width *= xScale;
+        height *= yScale;
+        while (height > 0 && hd + ((size_t)(height - 1) * stride + width) * 4 > end) {
+            height--;
+        }
+        if (width == 0 || height == 0) {
+            return false;
+        }
+        uint8_t* dst = mTexUploadBuffer;
+        for (uint32_t y = 0; y < height; y++) {
+            const uint8_t* row = hd + (size_t)y * stride * 4;
+            for (uint32_t x = 0; x < width; x++, dst += 4) {
+                dst[0] = (uint8_t)(row[x * 4 + 3] >= 128 ? mask->opaque : mask->transparent);
+                dst[1] = 0;
+                dst[2] = 0;
+                dst[3] = 255;
+            }
+        }
+    } else if (mImportIndexed) {
         // One index texture serves every palette built from this raster, so the shading
         // pass changing tone each frame costs no upload.
         const bool ci4 = tt.siz == G_IM_SIZ_4b;
@@ -1809,11 +2030,14 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
 
     // The pack may carry art per palette ("alt/<raster>@<palette>"); otherwise the base
     // stands in for every named palette. A palette built at run time (sprite shading,
-    // status tints) has no name, so the tile keeps its N64 texels through it.
+    // status tints) has no name, so the tile keeps its N64 texels through it, unless the
+    // game says which two named palettes it lerps between.
     if (!importReplacement) {
         if (auto variant = ResolvePaletteVariant(metadata, tile)) {
             addr = variant->ImageData;
             resource = variant;
+        } else if (const uint8_t* mixed = BlendPaletteVariants(metadata, tile)) {
+            addr = mixed;
         } else if (!TilePaletteIsNamed(tile) && UploadVanillaCi(tile)) {
             return;
         }
@@ -1857,19 +2081,36 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
         safeFullImageLineSizeBytes = resourceImageSizeBytes;
     }
 
+    // The load starts at addr and steps a full line per row. A tile that reads past the
+    // last row of the image must stop at the end of the resource.
+    uint32_t packedBytes = safeLoadedBytes;
+    if (addr >= resource->ImageData && addr < resource->ImageData + resourceImageSizeBytes && safeLineSizeBytes > 0 &&
+        safeFullImageLineSizeBytes >= safeLineSizeBytes) {
+        const size_t avail = resource->ImageData + resourceImageSizeBytes - addr;
+        uint32_t rows = safeLoadedBytes / safeLineSizeBytes;
+        while (rows > 0 && (size_t)(rows - 1) * safeFullImageLineSizeBytes + safeLineSizeBytes > avail) {
+            rows--;
+        }
+        safeLoadedBytes = std::min<uint32_t>(safeLoadedBytes, rows * safeLineSizeBytes);
+    }
+
     // Safely only copy the amount of bytes the resource can allow
     for (uint32_t i = 0, j = 0; i < safeLoadedBytes; i += safeLineSizeBytes, j += safeFullImageLineSizeBytes) {
         memcpy(mTexUploadBuffer + i, addr + j, safeLineSizeBytes);
     }
 
     // Set the remaining bytes to load as 0
+    if (packedBytes > safeLoadedBytes) {
+        // The rows past the resource stay blank
+        memset(mTexUploadBuffer + safeLoadedBytes, 0, packedBytes - safeLoadedBytes);
+    }
     if (numLoadedBytes > resourceImageSizeBytes) {
         memset(mTexUploadBuffer + resourceImageSizeBytes, 0, numLoadedBytes - resourceImageSizeBytes);
     }
 
     // Describe the buffer by what was actually packed (the loaded HD stride)
     uint32_t uploadWidth = safeLineSizeBytes / 4;
-    uint32_t uploadHeight = safeLineSizeBytes > 0 ? safeLoadedBytes / safeLineSizeBytes : 0;
+    uint32_t uploadHeight = safeLineSizeBytes > 0 ? packedBytes / safeLineSizeBytes : 0;
     const bool singleLineLoad = uploadHeight <= 1 && resultNewLineSize != 0 && resultNewLineSize < safeLineSizeBytes;
     if (uploadWidth > (uint32_t)mRapi->GetMaxTextureSize() || singleLineLoad) {
         if (safeLoadedBytes == (uint64_t)width * height * 4) {
@@ -2176,12 +2417,20 @@ static void ScaleAlphaToCoverage(uint8_t* buf, size_t count, float targetCoverag
     }
 }
 
-// Box-filter downsample an RGBA32 image to half size (min 1px). RGB is weighted by
-// alpha so transparent texels don't bleed color into the edge; edges clamp on odd sizes.
-void Interpreter::BoxDownsampleRgba32(const uint8_t* src, uint32_t srcW, uint32_t srcH, uint8_t* dst) {
-    uint32_t dstW = std::max(1u, srcW >> 1);
-    uint32_t dstH = std::max(1u, srcH >> 1);
-    for (uint32_t y = 0; y < dstH; y++) {
+// Box-filter downsample rows [y0, y1) of the half-size image. RGB is weighted by alpha
+// so transparent texels don't bleed color into the edge; edges clamp on odd sizes.
+static void BoxDownsampleRows(const uint8_t* src, uint32_t srcW, uint32_t srcH, uint8_t* dst, uint32_t y0,
+                              uint32_t y1) {
+    // 2^20 / aSum: a multiply instead of three divides per texel
+    static const std::array<uint32_t, 1021> kRecip = [] {
+        std::array<uint32_t, 1021> t{};
+        for (uint32_t a = 1; a < t.size(); a++) {
+            t[a] = ((1u << 20) + a / 2) / a;
+        }
+        return t;
+    }();
+    const uint32_t dstW = std::max(1u, srcW >> 1);
+    for (uint32_t y = y0; y < y1; y++) {
         uint32_t sy0 = y * 2;
         uint32_t sy1 = std::min(sy0 + 1, srcH - 1);
         for (uint32_t x = 0; x < dstW; x++) {
@@ -2195,8 +2444,8 @@ void Interpreter::BoxDownsampleRgba32(const uint8_t* src, uint32_t srcW, uint32_
 
             uint32_t aSum = (uint32_t)p00[3] + p01[3] + p10[3] + p11[3];
             d[3] = (uint8_t)((aSum + 2) >> 2);
-            if (aSum == 0) {
-                // Fully transparent block: color is invisible, keep a plain average.
+            if (aSum == 0 || aSum == 4 * 255) {
+                // All opaque or all transparent: plain average
                 for (int c = 0; c < 3; c++) {
                     d[c] = (uint8_t)((p00[c] + p01[c] + p10[c] + p11[c] + 2) >> 2);
                 }
@@ -2204,14 +2453,38 @@ void Interpreter::BoxDownsampleRgba32(const uint8_t* src, uint32_t srcW, uint32_
                 for (int c = 0; c < 3; c++) {
                     uint32_t w = (uint32_t)p00[c] * p00[3] + (uint32_t)p01[c] * p01[3] +
                                  (uint32_t)p10[c] * p10[3] + (uint32_t)p11[c] * p11[3];
-                    d[c] = (uint8_t)((w + aSum / 2) / aSum);
+                    d[c] = (uint8_t)(((uint64_t)w * kRecip[aSum] + (1u << 19)) >> 20);
                 }
             }
         }
     }
 }
 
+// Box-filter downsample an RGBA32 image to half size (min 1px). Big levels split
+// across threads.
+void Interpreter::BoxDownsampleRgba32(const uint8_t* src, uint32_t srcW, uint32_t srcH, uint8_t* dst,
+                                      uint32_t threads) {
+    const uint32_t dstW = std::max(1u, srcW >> 1);
+    const uint32_t dstH = std::max(1u, srcH >> 1);
+    if ((size_t)dstW * dstH < (1u << 18)) {
+        threads = 1;
+    }
+    if (threads <= 1) {
+        BoxDownsampleRows(src, srcW, srcH, dst, 0, dstH);
+        return;
+    }
+    std::vector<std::thread> workers;
+    for (uint32_t t = 1; t < threads; t++) {
+        workers.emplace_back(BoxDownsampleRows, src, srcW, srcH, dst, dstH * t / threads, dstH * (t + 1) / threads);
+    }
+    BoxDownsampleRows(src, srcW, srcH, dst, 0, dstH / threads);
+    for (auto& worker : workers) {
+        worker.join();
+    }
+}
+
 void Interpreter::UploadBaseTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) {
+    mImportUploaded = true;
     mFrameTextureUploads++;
     mFrameUploadBytes += (size_t)width * height * 4;
     if (mCurrentMipExtraLevels > 0) {
@@ -2233,16 +2506,36 @@ void Interpreter::UploadBaseTexture(const uint8_t* rgba32Buf, uint32_t width, ui
         return;
     }
 
-    constexpr uint32_t MIN_MIP_SIZE = 16;
-    uint32_t maxDim = std::max(width, height);
-    uint32_t totalLevels = 1;
-    while ((maxDim >> totalLevels) >= MIN_MIP_SIZE) {
-        totalLevels++;
-    }
-
+    const uint32_t totalLevels = MipLevelCount(width, height);
     if (totalLevels <= 1) {
         mRapi->UploadTexture(rgba32Buf, width, height);
         return;
+    }
+
+    // Use the mip chain on the resource when the whole replacement is being uploaded,
+    // building it now if the prefetch did not.
+    const uint32_t threads = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 4u);
+    Fast::Texture* res =
+        mRdp->loaded_texture[mRdp->texture_tile[mImportTile].tmem_index].raw_tex_metadata.resource.get();
+    const std::vector<Fast::Texture::MipLevel>* levels = &mMipChainScratch;
+    if (res != nullptr && rgba32Buf == res->ImageData && width == res->Width && height == res->Height) {
+        if (!res->MipsReady.load(std::memory_order_acquire)) {
+            if (!res->MipsBuilding.exchange(true)) {
+                BuildMipChain(rgba32Buf, width, height, res->Mips, threads);
+                res->MipsReady.store(true, std::memory_order_release);
+            } else {
+                // The prefetch is building it now. Don't wait.
+                res = nullptr;
+            }
+        }
+        if (res != nullptr) {
+            levels = &res->Mips;
+        }
+    } else {
+        res = nullptr;
+    }
+    if (res == nullptr) {
+        BuildMipChain(rgba32Buf, width, height, mMipChainScratch, threads);
     }
 
     // Tell the backend these levels are auto-generated, so its sampler uses
@@ -2258,6 +2551,37 @@ void Interpreter::UploadBaseTexture(const uint8_t* rgba32Buf, uint32_t width, ui
         { 255, 0, 0 },   { 0, 255, 0 },   { 0, 128, 255 }, { 255, 255, 0 },
         { 255, 0, 255 }, { 0, 255, 255 }, { 255, 255, 255 },
     };
+    for (uint32_t level = 1; level < totalLevels && level <= levels->size(); level++) {
+        const Fast::Texture::MipLevel& mip = (*levels)[level - 1];
+        const uint8_t* pixels = mip.Pixels.data();
+        if (mipDebug) {
+            mMipLevelBuffer.assign(pixels, pixels + mip.Pixels.size());
+            const uint8_t* color = kMipDebugColors[(level - 1) % 7];
+            for (size_t p = 0; p < (size_t)mip.Width * mip.Height; p++) {
+                mMipLevelBuffer[p * 4 + 0] = color[0];
+                mMipLevelBuffer[p * 4 + 1] = color[1];
+                mMipLevelBuffer[p * 4 + 2] = color[2];
+            }
+            pixels = mMipLevelBuffer.data();
+        }
+        mRapi->UploadTextureMip(pixels, mip.Width, mip.Height, level, totalLevels);
+    }
+}
+
+uint32_t Interpreter::MipLevelCount(uint32_t width, uint32_t height) {
+    constexpr uint32_t MIN_MIP_SIZE = 16;
+    const uint32_t maxDim = std::max(width, height);
+    uint32_t totalLevels = 1;
+    while ((maxDim >> totalLevels) >= MIN_MIP_SIZE) {
+        totalLevels++;
+    }
+    return totalLevels;
+}
+
+void Interpreter::BuildMipChain(const uint8_t* rgba32Buf, uint32_t width, uint32_t height,
+                                std::vector<Fast::Texture::MipLevel>& levels, uint32_t threads) {
+    const uint32_t totalLevels = MipLevelCount(width, height);
+    levels.resize(totalLevels > 0 ? totalLevels - 1 : 0);
 
     // Measure the base image's alpha-test coverage. Only textures with a real
     // alpha edge (some opaque, some transparent texels) need coverage
@@ -2272,34 +2596,20 @@ void Interpreter::UploadBaseTexture(const uint8_t* rgba32Buf, uint32_t width, ui
     const bool preserveCoverage = baseOpaque > 0 && baseOpaque < baseTexels;
     const float baseCoverage = (float)baseOpaque / (float)baseTexels;
 
-    // Ping-pong between the two scratch buffers so each level's source (the
-    // previous level) stays valid while the next is written.
     const uint8_t* srcBuf = rgba32Buf;
     uint32_t srcW = width;
     uint32_t srcH = height;
-    for (uint32_t level = 1; level < totalLevels; level++) {
-        uint32_t dstW = std::max(1u, srcW >> 1);
-        uint32_t dstH = std::max(1u, srcH >> 1);
-        std::vector<uint8_t>& dst = mMipScratch[level & 1];
-        dst.resize((size_t)dstW * dstH * 4);
-        BoxDownsampleRgba32(srcBuf, srcW, srcH, dst.data());
+    for (Fast::Texture::MipLevel& level : levels) {
+        level.Width = std::max(1u, srcW >> 1);
+        level.Height = std::max(1u, srcH >> 1);
+        level.Pixels.resize((size_t)level.Width * level.Height * 4);
+        BoxDownsampleRgba32(srcBuf, srcW, srcH, level.Pixels.data(), threads);
         if (preserveCoverage) {
-            ScaleAlphaToCoverage(dst.data(), (size_t)dstW * dstH, baseCoverage);
+            ScaleAlphaToCoverage(level.Pixels.data(), (size_t)level.Width * level.Height, baseCoverage);
         }
-        if (mipDebug) {
-            // Tint RGB to this level's color, keep the box-filtered alpha so
-            // cutout shapes stay intact.
-            const uint8_t* color = kMipDebugColors[(level - 1) % 7];
-            for (size_t p = 0; p < (size_t)dstW * dstH; p++) {
-                dst[p * 4 + 0] = color[0];
-                dst[p * 4 + 1] = color[1];
-                dst[p * 4 + 2] = color[2];
-            }
-        }
-        mRapi->UploadTextureMip(dst.data(), dstW, dstH, level, totalLevels);
-        srcBuf = dst.data();
-        srcW = dstW;
-        srcH = dstH;
+        srcBuf = level.Pixels.data();
+        srcW = level.Width;
+        srcH = level.Height;
     }
 }
 
@@ -2379,6 +2689,7 @@ void Interpreter::UploadMipChain(uint32_t baseTile) {
 }
 
 void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
+    mImportTile = tile;
     uint8_t fmt = mRdp->texture_tile[tile].fmt;
     uint8_t siz = mRdp->texture_tile[tile].siz;
     uint32_t texFlags = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags;
@@ -2447,6 +2758,11 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         key.palette_addrs[1] = nullptr;
         key.palette_index = 0;
         key.indexed = 1;
+        if (const PaletteMask* mask = TilePaletteMask(tile)) {
+            key.indexed = 2;
+            key.mask[0] = (uint8_t)mask->opaque;
+            key.mask[1] = (uint8_t)mask->transparent;
+        }
     }
 
     if (importReplacement && mAllowReplacementDefer && mReplacementUploadBudget > 0 &&
@@ -2459,6 +2775,17 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     if (TextureCacheLookup(i, key)) {
         return;
     }
+
+    mImportUploaded = false;
+    struct DropUnlessUploaded {
+        Interpreter* gfx;
+        int slot;
+        ~DropUnlessUploaded() {
+            if (!gfx->mImportUploaded) {
+                gfx->TextureCacheDrop(slot);
+            }
+        }
+    } dropUnlessUploaded{ this, i };
 
     // Past the lookup on a miss means this replacement will upload now — count it
     // against this frame's budget so further first-time replacements are deferred.
@@ -3065,7 +3392,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         cc_options |= i == 0 ? SHADER_OPT(TEXEL0_PALETTE) : SHADER_OPT(TEXEL1_PALETTE);
     }
 
-    ColorCombinerKey key;
+    ColorCombinerKey key{};
     key.combine_mode = mRdp->combine_mode;
     key.options = cc_options;
 
@@ -3111,7 +3438,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             // so a mode change must re-run the import even when the tile data didn't change.
             if (mRenderingState.mTextures[i] != nullptr &&
                 ((i == 0 && mRenderingState.mTextures[0]->first.mip_levels != mipExtraLevels) ||
-                 mRenderingState.mTextures[i]->first.indexed != (palettized[i] ? 1 : 0))) {
+                 (mRenderingState.mTextures[i]->first.indexed != 0) != palettized[i])) {
                 mRdp->textures_changed[i] = true;
             }
             if (mRdp->textures_changed[i]) {
@@ -3874,9 +4201,16 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
         const uint32_t firstBank = paletteByteOffset / 32;
         const auto& tlutRes = mRdp->texture_to_load.raw_tex_metadata.resource;
         const std::string tlutPath = tlutRes != nullptr ? tlutRes->GetInitData()->Path : std::string();
+        // What the game said a raw palette is this frame (gDPPaletteBlend, gDPPaletteMask)
+        const auto blend = tlutRes == nullptr ? mPaletteBlends.find(src) : mPaletteBlends.end();
+        const auto mask = tlutRes == nullptr ? mPaletteMasks.find(src) : mPaletteMasks.end();
+        const bool lerped = blend != mPaletteBlends.end() && blend->second.frame == mCustomFrameCount;
+        const bool masked = mask != mPaletteMasks.end() && mask->second.frame == mCustomFrameCount;
         for (uint32_t b = firstBank; b < 16 && (b - firstBank) * 32 < byteCount; b++) {
             mRdp->palette_bank_dram_addr[b] = src + (b - firstBank) * 32;
             mTlutPath[b] = tlutPath;
+            mTlutBlend[b] = lerped ? blend->second : PaletteBlend{};
+            mTlutMask[b] = masked ? mask->second : PaletteMask{};
         }
 
         if (high_index == 255 && paletteByteOffset == 0) {
@@ -6027,6 +6361,36 @@ bool gfx_inval_tex_by_pal_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// G_PAL_BLEND: the palette at w1 is the game's lerp between the two palette resources
+// named by the next Gfx, by the alpha in w0. See gDPPaletteBlend.
+bool gfx_palette_blend_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    const uint8_t* palette = (const uint8_t*)(uintptr_t)cmd->words.w1;
+    const uint8_t alpha = C0(0, 8);
+    cmd = ++(*cmd0);
+    const char* from = (const char*)cmd->words.w0;
+    const char* to = (const char*)cmd->words.w1;
+    // Either end may be palette bytes rather than a name (no such resource), and then
+    // the palette has no HD art to mix.
+    if (palette != nullptr && gfx_check_image_signature(from) == 1 && gfx_check_image_signature(to) == 1) {
+        gfx->SetPaletteBlend(palette, from, to, alpha);
+    }
+    return false;
+}
+
+// G_PAL_MASK: through the palette at w1, opaque texels read one entry and transparent
+// texels another (both in w0). See gDPPaletteMask.
+bool gfx_palette_mask_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    const uint8_t* palette = (const uint8_t*)(uintptr_t)cmd->words.w1;
+    if (palette != nullptr) {
+        gfx->SetPaletteMask(palette, C0(8, 8), C0(0, 8));
+    }
+    return false;
+}
+
 bool gfx_set_strict_decal_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -6709,6 +7073,8 @@ static constexpr UcodeHandler otrHandlers = {
     { RDP_G_TRI1_WIDE, { "G_TRI1_WIDE", gfx_tri1_handler_f3dex2 } },                   // RDP_G_TRI1_WIDE (-17)
     { OTR_G_INVAL_TEX_BY_PAL, { "G_INVAL_TEX_BY_PAL", gfx_inval_tex_by_pal_handler_custom } },
     { OTR_G_SET_STRICT_DECAL, { "G_SET_STRICT_DECAL", gfx_set_strict_decal_handler_custom } },
+    { OTR_G_PAL_BLEND, { "G_PAL_BLEND", gfx_palette_blend_handler_custom } },
+    { OTR_G_PAL_MASK, { "G_PAL_MASK", gfx_palette_mask_handler_custom } },
 };
 
 static constexpr UcodeHandler f3dex2Handlers = {
@@ -7191,6 +7557,12 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
+
+    // Last frame's records stay, so a lerp that carries on unchanged keeps its uploads;
+    // anything older is a palette the game has moved on from.
+    const auto stale = [this](const auto& entry) { return entry.second.frame + 1 < mCustomFrameCount; };
+    std::erase_if(mPaletteBlends, stale);
+    std::erase_if(mPaletteMasks, stale);
 
     mCurMtxReplacements = &mtx_replacements;
     mCurDlReplacements = &dl_replacements;

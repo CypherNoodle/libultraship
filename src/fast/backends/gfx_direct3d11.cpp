@@ -583,7 +583,10 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
     ThrowIfFailed(
         mDevice->CreateTexture2D(&texture_desc, &resource_data, texture_data->texture.ReleaseAndGetAddressOf()));
     texture_data->mip_levels = 1;
-    texture_data->auto_mipmaps = false;
+    if (texture_data->auto_mipmaps) {
+        texture_data->auto_mipmaps = false;
+        SetSamplerParameters(mCurrentTile, texture_data->linear_filtering, texture_data->cms, texture_data->cmt);
+    }
 
     // Create shader resource view from texture
 
@@ -603,7 +606,10 @@ void GfxRenderingAPIDX11::UploadTextureMip(const uint8_t* rgba32_buf, uint32_t w
         texture_data->width = width;
         texture_data->height = height;
         texture_data->mip_levels = totalLevels;
-        texture_data->auto_mipmaps = mNextTextureAutoMipmap;
+        if (texture_data->auto_mipmaps != mNextTextureAutoMipmap) {
+            texture_data->auto_mipmaps = mNextTextureAutoMipmap;
+            SetSamplerParameters(mCurrentTile, texture_data->linear_filtering, texture_data->cms, texture_data->cmt);
+        }
 
         // Mip levels arrive one at a time, so the texture must be DEFAULT
         // (updatable) rather than IMMUTABLE.
@@ -640,7 +646,12 @@ void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uin
     // CPU auto-generated pyramids use anisotropic filtering (trilinear + grazing-angle
     // sharpness) with a negative LOD bias; native N64 mips keep point/linear mip-point
     // sampling driven by the shader's explicit integer LOD.
-    if (texture_data->auto_mipmaps) {
+    const bool repeats = (cms & (G_TX_MIRROR | G_TX_CLAMP)) == 0 || (cmt & (G_TX_MIRROR | G_TX_CLAMP)) == 0;
+    if (texture_data->auto_mipmaps && !linear_filter) {
+        sampler_desc.Filter = D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR;
+    } else if (texture_data->auto_mipmaps && repeats) {
+        sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    } else if (texture_data->auto_mipmaps) {
         sampler_desc.Filter = D3D11_FILTER_ANISOTROPIC;
         sampler_desc.MaxAnisotropy = 8;
     } else {
@@ -655,6 +666,8 @@ void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uin
     sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
 
     texture_data->linear_filtering = linear_filter;
+    texture_data->cms = cms;
+    texture_data->cmt = cmt;
 
     // This function is called twice per texture, the first one only to set default values.
     // Maybe that could be skipped? Anyway, make sure to release the first default sampler
