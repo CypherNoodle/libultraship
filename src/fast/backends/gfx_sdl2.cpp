@@ -25,9 +25,7 @@
 
 #if defined(__SWITCH__)
 #include <SDL2/SDL.h>
-#ifdef __SWITCH__
-#include <cstdlib>
-#endif
+#include <stdlib.h>
 #include <glad/glad.h>
 #elif FOR_WINDOWS
 #include <GL/glew.h>
