@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+#include <algorithm>
 #include <map>
 #include <unordered_map>
 
@@ -799,11 +800,19 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
     const bool repeats = (cms & (G_TX_MIRROR | G_TX_CLAMP)) == 0 || (cmt & (G_TX_MIRROR | G_TX_CLAMP)) == 0;
-    const float anisotropy = tex.auto_mipmaps && !repeats ? 8.0f : 1.0f;
+    const float requestedAnisotropy = static_cast<float>(std::clamp(
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_ANISOTROPIC_FILTERING, 8), 1, 16));
+    const float anisotropy = tex.auto_mipmaps && !repeats
+                                 ? std::min(requestedAnisotropy, mMaxAnisotropy)
+                                 : 1.0f;
 #ifdef GL_TEXTURE_MAX_ANISOTROPY
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, anisotropy);
+    if (mMaxAnisotropy > 1.0f) {
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, anisotropy);
+    }
 #elif defined(GL_TEXTURE_MAX_ANISOTROPY_EXT)
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, anisotropy);
+    if (mMaxAnisotropy > 1.0f) {
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, anisotropy);
+    }
 #endif
     textures[mCurrentTextureIds[tile]].filtering = !linear_filter ? FILTER_LINEAR : FILTER_THREE_POINT;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gfx_cm_to_opengl(cms));
@@ -961,6 +970,21 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
 void GfxRenderingAPIOGL::Init() {
 #if !defined(__SWITCH__) && !defined(__linux__) && !defined(__OpenBSD__) && !defined(USE_OPENGLES)
     glewInit();
+#endif
+
+#if defined(GL_MAX_TEXTURE_MAX_ANISOTROPY) || defined(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT)
+    // Querying an unsupported anisotropy enum raises INVALID_ENUM. Treat that as
+    // 1x support instead of applying an invalid texture parameter later.
+    while (glGetError() != GL_NO_ERROR) {
+    }
+#ifdef GL_MAX_TEXTURE_MAX_ANISOTROPY
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &mMaxAnisotropy);
+#else
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &mMaxAnisotropy);
+#endif
+    if (glGetError() != GL_NO_ERROR) {
+        mMaxAnisotropy = 1.0f;
+    }
 #endif
 
     glGenBuffers(1, &mOpenglVbo);

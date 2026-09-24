@@ -174,6 +174,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
 
     GLint mMaxMsaaLevel = 1;
+    GLfloat mMaxAnisotropy = 1.0f;
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;

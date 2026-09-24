@@ -1,6 +1,7 @@
 #ifdef ENABLE_DX11
 
 #include <cstdio>
+#include <algorithm>
 #include <vector>
 #include <cmath>
 
@@ -647,13 +648,17 @@ void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uin
     // sharpness) with a negative LOD bias; native N64 mips keep point/linear mip-point
     // sampling driven by the shader's explicit integer LOD.
     const bool repeats = (cms & (G_TX_MIRROR | G_TX_CLAMP)) == 0 || (cmt & (G_TX_MIRROR | G_TX_CLAMP)) == 0;
+    const int anisotropy = std::clamp(
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_ANISOTROPIC_FILTERING, 8), 1, 16);
     if (texture_data->auto_mipmaps && !linear_filter) {
         sampler_desc.Filter = D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR;
     } else if (texture_data->auto_mipmaps && repeats) {
         sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    } else if (texture_data->auto_mipmaps) {
+    } else if (texture_data->auto_mipmaps && anisotropy > 1) {
         sampler_desc.Filter = D3D11_FILTER_ANISOTROPIC;
-        sampler_desc.MaxAnisotropy = 8;
+        sampler_desc.MaxAnisotropy = anisotropy;
+    } else if (texture_data->auto_mipmaps) {
+        sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     } else {
         sampler_desc.Filter = linear_filter && mCurrentFilterMode == FILTER_LINEAR ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
                                                                                    : D3D11_FILTER_MIN_MAG_MIP_POINT;

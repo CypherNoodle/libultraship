@@ -449,9 +449,11 @@ void GfxRenderingAPIMetal::SetSamplerParameters(int tile, bool linear_filter, ui
     // shader; Nearest picks the exact level. CPU auto-generated pyramids use hardware
     // derivative LOD with trilinear blending (no per-pixel stipple) + anisotropy.
     const bool repeats = (cms & (G_TX_MIRROR | G_TX_CLAMP)) == 0 || (cmt & (G_TX_MIRROR | G_TX_CLAMP)) == 0;
+    const int anisotropy = std::clamp(
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_ANISOTROPIC_FILTERING, 8), 1, 16);
     if (texture_data->auto_mipmaps) {
         sampler_descriptor->setMipFilter(MTL::SamplerMipFilterLinear);
-        sampler_descriptor->setMaxAnisotropy(repeats ? 1 : 8);
+        sampler_descriptor->setMaxAnisotropy(repeats ? 1 : anisotropy);
     } else {
         sampler_descriptor->setMipFilter(MTL::SamplerMipFilterNearest);
     }

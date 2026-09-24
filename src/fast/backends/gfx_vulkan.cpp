@@ -563,7 +563,10 @@ VkRenderPass GfxRenderingAPIVK::GetRenderPass(uint32_t msaaLevel, bool hasDepth)
 }
 
 VkSampler GfxRenderingAPIVK::GetSampler(bool linear, uint32_t cms, uint32_t cmt, bool autoMipmap) {
-    uint32_t key = (linear ? 1u : 0) | (cms << 1) | (cmt << 9) | (autoMipmap ? (1u << 17) : 0);
+    const uint32_t requestedAnisotropy = static_cast<uint32_t>(std::clamp(
+        mConsoleVariable->GetInteger(CVAR_ANISOTROPIC_FILTERING, 8), 1, 16));
+    uint32_t key = (linear ? 1u : 0) | (cms << 1) | (cmt << 9) | (autoMipmap ? (1u << 17) : 0) |
+                   (requestedAnisotropy << 18);
     auto it = mSamplerCache.find(key);
     if (it != mSamplerCache.end()) {
         return it->second;
@@ -583,9 +586,10 @@ VkSampler GfxRenderingAPIVK::GetSampler(bool linear, uint32_t cms, uint32_t cmt,
     si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     si.minLod = 0.0f;
     si.maxLod = VK_LOD_CLAMP_NONE;
-    if (autoMipmap && mHasAnisotropy) {
+    if (autoMipmap && mHasAnisotropy && requestedAnisotropy > 1) {
         si.anisotropyEnable = VK_TRUE;
-        si.maxAnisotropy = std::min(8.0f, mDeviceProps.limits.maxSamplerAnisotropy);
+        si.maxAnisotropy = std::min(static_cast<float>(requestedAnisotropy),
+                                    mDeviceProps.limits.maxSamplerAnisotropy);
     }
 
     VkSampler sampler = VK_NULL_HANDLE;
