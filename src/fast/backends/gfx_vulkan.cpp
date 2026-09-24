@@ -836,6 +836,10 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
     if (R_FAILED(nwindowSetDimensions(nwindowGetDefault(), width, height))) {
         throw std::runtime_error("Vulkan: failed to size the Switch native window");
     }
+    // Scale lower-resolution swapchains to the full handheld/TV layer instead
+    // of presenting them centred with a border. libnx mode 1 is
+    // NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW.
+    nwindowGetDefault()->scaling_mode = 1;
     VkViSurfaceCreateInfoNN surfaceInfo = { VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN };
     surfaceInfo.window = nwindowGetDefault();
     if (!vkCreateViSurfaceNN || vkCreateViSurfaceNN(mInstance, &surfaceInfo, nullptr, &mSurface) != VK_SUCCESS) {

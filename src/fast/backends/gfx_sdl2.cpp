@@ -84,6 +84,13 @@ static void GetSwitchOutputResolution(int& width, int& height) {
     height = selectedHeight <= 0 ? defaultHeight : std::clamp(selectedHeight, minimumHeight, defaultHeight);
     width = height * 16 / 9;
 }
+
+static void EnableSwitchOutputScaling() {
+    // libnx defaults to NATIVE_WINDOW_SCALING_MODE_FREEZE (0), which leaves a
+    // lower-resolution buffer centred inside the physical display. Mode 1 is
+    // NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW and expands it to the layer.
+    nwindowGetDefault()->scaling_mode = 1;
+}
 #endif
 
 const SDL_Scancode lus_to_sdl_table[] = {
@@ -490,6 +497,7 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     if (mWnd == nullptr) {
         throw std::runtime_error(std::string("SDL window: ") + SDL_GetError());
     }
+    EnableSwitchOutputScaling();
     SPDLOG_INFO("Switch: SDL window created");
 #endif
 #ifdef __EMSCRIPTEN__
