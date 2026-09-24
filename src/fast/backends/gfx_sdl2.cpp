@@ -1,6 +1,7 @@
 #if defined(ENABLE_OPENGL) || defined(__APPLE__)
 
 #include <stdio.h>
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -25,6 +26,7 @@
 
 #if defined(__SWITCH__)
 #include <SDL2/SDL.h>
+#include <switch.h>
 #include <stdlib.h>
 #include <glad/glad.h>
 #elif FOR_WINDOWS
@@ -70,6 +72,20 @@ LONG_PTR SDL_WndProc;
 #endif
 
 namespace Fast {
+#ifdef __SWITCH__
+static void GetSwitchOutputResolution(int& width, int& height) {
+    const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
+    const char* cvar = docked ? "gSettings.SwitchOutputResolution.Docked"
+                              : "gSettings.SwitchOutputResolution.Handheld";
+    const int defaultHeight = docked ? 1080 : 720;
+    const int minimumHeight = docked ? 540 : 360;
+    const int selectedHeight =
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(cvar, 0);
+    height = selectedHeight <= 0 ? defaultHeight : std::clamp(selectedHeight, minimumHeight, defaultHeight);
+    width = height * 16 / 9;
+}
+#endif
+
 const SDL_Scancode lus_to_sdl_table[] = {
     SDL_SCANCODE_UNKNOWN,
     SDL_SCANCODE_ESCAPE,
@@ -464,9 +480,8 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     }
 #endif
 #ifdef __SWITCH__
-    // A fixed 720p surface also works when docked; SDL handles presentation scaling.
-    mWindowWidth = 1280;
-    mWindowHeight = 720;
+    GetSwitchOutputResolution(mWindowWidth, mWindowHeight);
+    mSwitchOperationMode = static_cast<int>(appletGetOperationMode());
     // The patched Switch SDL driver leaves plain windows to native Vulkan.
     flags = SDL_WINDOW_SHOWN | (use_opengl ? SDL_WINDOW_OPENGL : 0);
 #endif
@@ -678,7 +693,7 @@ void GfxWindowBackendSDL2::GetDimensions(uint32_t* width, uint32_t* height, int3
     } else {
         SDL_GetWindowSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
     }
-#elif defined(__APPLE__) || defined(__EMSCRIPTEN__)
+#elif defined(__APPLE__) || defined(__EMSCRIPTEN__) || defined(__SWITCH__)
     // macOS and browsers: window geometry is logical points (CSS pixels on the web); the
     // pixel-density scale is applied where the internal render size is computed.
     SDL_GetWindowSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
@@ -811,7 +826,7 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
                     } else {
                         SDL_GetWindowSize(mWnd, &mWindowWidth, &mWindowHeight);
                     }
-#elif defined(__APPLE__) || defined(__EMSCRIPTEN__)
+#elif defined(__APPLE__) || defined(__EMSCRIPTEN__) || defined(__SWITCH__)
                     // macOS and browsers: window geometry is logical points (CSS pixels on the web); the
                     // pixel-density scale is applied where the internal render size is computed.
                     SDL_GetWindowSize(mWnd, &mWindowWidth, &mWindowHeight);
@@ -838,6 +853,16 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
 }
 
 void GfxWindowBackendSDL2::HandleEvents() {
+#ifdef __SWITCH__
+    const int operationMode = static_cast<int>(appletGetOperationMode());
+    if (operationMode != mSwitchOperationMode) {
+        int width;
+        int height;
+        GetSwitchOutputResolution(width, height);
+        SetDimensions(width, height, 0, 0);
+        mSwitchOperationMode = operationMode;
+    }
+#endif
     SDL_Event event;
     SDL_PumpEvents();
     while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_CONTROLLERDEVICEADDED - 1) > 0) {

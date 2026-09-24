@@ -1,6 +1,8 @@
 #include "ship/window/gui/StatsWindow.h"
 #include <imgui.h>
 #include "spdlog/spdlog.h"
+#include "ship/Context.h"
+#include "ship/window/Window.h"
 
 namespace Ship {
 StatsWindow::~StatsWindow() {
@@ -25,9 +27,14 @@ void StatsWindow::DrawElement() {
     ImGui::Text("Platform: Linux");
 #elif defined(__OpenBSD__)
     ImGui::Text("Platform: OpenBSD");
+#elif defined(__SWITCH__)
+    ImGui::Text("Platform: Nintendo Switch");
 #else
     ImGui::Text("Platform: Unknown");
 #endif
+    const auto window = Context::GetRawInstance()->GetWindow();
+    const std::string renderer = window != nullptr ? window->GetWindowBackendName() : "";
+    ImGui::Text("Renderer: %s", renderer.empty() ? "Unknown" : renderer.c_str());
     ImGui::Text("Status: %0.3f ms/frame (%0.1f FPS)", deltatime * 1000.0f, framerate);
     ImGui::PopStyleColor();
 }

@@ -66,6 +66,9 @@ class GfxWindowBackendSDL2 final : public GfxWindowBackend {
     // OTRTODO: These are redundant. Info can be queried from SDL.
     int mWindowWidth = 640;
     int mWindowHeight = 480;
+#ifdef __SWITCH__
+    int mSwitchOperationMode = -1;
+#endif
     void (*mOnAllKeysUp)();
 };
 } // namespace Fast
