@@ -6277,6 +6277,10 @@ static bool IsValidResolvedAddress(uintptr_t addr) {
     HMODULE module = nullptr;
     return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                               reinterpret_cast<LPCSTR>(addr), &module) != 0;
+#elif defined(__SWITCH__)
+    // Switch has no host dynamic loader; low addresses are handled by the
+    // interpreter's segmented-address checks and are not module lookups.
+    return true;
 #else
     // For non-Windows platforms, check whether the address belongs to a loaded object.
     Dl_info info;
