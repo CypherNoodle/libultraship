@@ -164,7 +164,7 @@ class Fast3dGui : public Ship::Gui {
     ImTextureID GetTextureById(int32_t id);
 
     std::weak_ptr<Interpreter> mInterpreter; ///< Weak reference to the Fast3D scripting interpreter.
-    GuiWindowInitData mImpl;                 ///< Backend-specific window/context handles passed to Init().
+    GuiWindowInitData mImpl{};               ///< Backend-specific window/context handles passed to Init().
 
   private:
     /** @brief Applies any pending resolution or MSAA changes to the render target. */

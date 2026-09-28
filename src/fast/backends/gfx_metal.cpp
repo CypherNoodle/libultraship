@@ -448,9 +448,10 @@ void GfxRenderingAPIMetal::SetSamplerParameters(int tile, bool linear_filter, ui
     // Native N64 mip chains are sampled with explicit integer LODs (level()) in the
     // shader; Nearest picks the exact level. CPU auto-generated pyramids use hardware
     // derivative LOD with trilinear blending (no per-pixel stipple) + anisotropy.
+    const bool repeats = (cms & (G_TX_MIRROR | G_TX_CLAMP)) == 0 || (cmt & (G_TX_MIRROR | G_TX_CLAMP)) == 0;
     if (texture_data->auto_mipmaps) {
         sampler_descriptor->setMipFilter(MTL::SamplerMipFilterLinear);
-        sampler_descriptor->setMaxAnisotropy(8);
+        sampler_descriptor->setMaxAnisotropy(repeats ? 1 : 8);
     } else {
         sampler_descriptor->setMipFilter(MTL::SamplerMipFilterNearest);
     }

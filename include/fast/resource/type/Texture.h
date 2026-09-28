@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ship/resource/Resource.h"
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -39,6 +40,16 @@ class Texture final : public Ship::Resource<uint8_t> {
     uint8_t* ImageData = nullptr;
     // When set, ImageData points into this buffer and must not be delete[]-ed.
     std::shared_ptr<std::vector<char>> mImageBuffer;
+
+    // Mip levels of ImageData, built off the render thread on prefetch. A builder
+    // claims MipsBuilding first, and readers wait for MipsReady.
+    struct MipLevel {
+        uint32_t Width, Height;
+        std::vector<uint8_t> Pixels;
+    };
+    std::vector<MipLevel> Mips;
+    std::atomic<bool> MipsBuilding{ false };
+    std::atomic<bool> MipsReady{ false };
 
     ~Texture();
 };

@@ -407,6 +407,11 @@ class ResourceManager {
      */
     void* GetResourceRawPointer(uint64_t crc);
 
+    /**
+     * @return The thread pool that runs asynchronous loads.
+     */
+    std::shared_ptr<BS::thread_pool> GetThreadPool();
+
   protected:
     std::shared_ptr<std::vector<std::shared_ptr<IResource>>> LoadResourcesProcess(const ResourceFilter& filter);
     void UnloadResourcesProcess(const ResourceFilter& filter);

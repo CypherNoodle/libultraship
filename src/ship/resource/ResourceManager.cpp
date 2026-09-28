@@ -192,6 +192,10 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
     return resource;
 }
 
+std::shared_ptr<BS::thread_pool> ResourceManager::GetThreadPool() {
+    return mThreadPool;
+}
+
 std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const std::string& filePath, bool loadExact,
                                                                 std::shared_ptr<ResourceInitData> initData) {
     return LoadResourceProcess({ filePath, mDefaultCacheOwner, mDefaultCacheArchive }, loadExact, initData);

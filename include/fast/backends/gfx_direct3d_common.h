@@ -58,6 +58,7 @@ struct TextureData {
     // Total mip levels uploaded (0/1 = base level only)
     uint32_t mip_levels;
     bool linear_filtering;
+    uint32_t cms, cmt;
     bool auto_mipmaps;
 };
 
