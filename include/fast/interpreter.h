@@ -219,7 +219,10 @@ struct TextureCacheKey {
     uint8_t mip_levels;
     // 1 = uploaded as a CI index texture (palette applied in the shader). Indexed
     // entries do not key on palette contents, which is what makes TLUT swaps free.
+    // 2 = the HD replacement's silhouette as indices (see gDPPaletteMask); mask[] are
+    // the entries its opaque and transparent pixels read.
     uint8_t indexed;
+    uint8_t mask[2];
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
 
@@ -841,7 +844,30 @@ class Interpreter {
     // loaded from a raw pointer. Names the "alt/<raster>@<palette>" replacement variant.
     std::string mTlutPath[16];
     std::shared_ptr<Fast::Texture> ResolvePaletteVariant(const RawTexMetadata* metadata, int tile);
+    std::shared_ptr<Fast::Texture> LoadPaletteVariant(const RawTexMetadata* metadata, const std::string& tlut);
     bool TilePaletteIsNamed(int tile) const;
+    // What the game says a palette it built at run time is (gDPPaletteBlend, gDPPaletteMask),
+    // by the address it lives at, for the frame it said so. A bank keeps a copy alongside
+    // mTlutPath while that palette is loaded in it.
+    struct PaletteBlend {
+        std::string from, to; // empty when the palette is not a lerp
+        uint8_t alpha = 0;
+        uint32_t frame = 0;
+    };
+    struct PaletteMask {
+        int16_t opaque = -1; // the entries opaque and transparent texels read; -1 when not a mask
+        int16_t transparent = -1;
+        uint32_t frame = 0;
+    };
+    std::unordered_map<const uint8_t*, PaletteBlend> mPaletteBlends;
+    std::unordered_map<const uint8_t*, PaletteMask> mPaletteMasks;
+    PaletteBlend mTlutBlend[16];
+    PaletteMask mTlutMask[16];
+    std::vector<uint8_t> mPaletteBlendBuffer;
+    void SetPaletteBlend(const uint8_t* palette, const char* from, const char* to, uint8_t alpha);
+    void SetPaletteMask(const uint8_t* palette, uint8_t opaque, uint8_t transparent);
+    const uint8_t* BlendPaletteVariants(const RawTexMetadata* metadata, int tile);
+    const PaletteMask* TilePaletteMask(int tile) const;
     uint32_t mMipBaseWidth = 0, mMipBaseHeight = 0; // level-0 upload size of the current chain
     std::vector<uint8_t> mMipLevelBuffer;
     std::vector<uint8_t> mMipBaseCopy;
