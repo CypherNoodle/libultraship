@@ -419,9 +419,12 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
 
 #if DEBUG_D3D
     UINT compile_flags = D3DCOMPILE_DEBUG;
+    UINT vs_compile_flags = D3DCOMPILE_DEBUG;
 #else
     // FXC's optimizer is most of the compile time, and the driver optimizes the bytecode again anyway.
     UINT compile_flags = D3DCOMPILE_SKIP_OPTIMIZATION;
+    // Vertex shaders are shared and rarely compiled. Unoptimized ones crash NVIDIA's driver under MSAA.
+    UINT vs_compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
 #endif
 
     // The vertex shader is the source up to the end of VSMain. HLSL declares before use,
@@ -448,8 +451,8 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     if (sharedVs != mVertexShadersBySource.end()) {
         vs = sharedVs->second.code;
     } else {
-        hr = mD3dCompile(vsSource.data(), vsSource.size(), nullptr, nullptr, nullptr, "VSMain", "vs_4_0", compile_flags,
-                         0, vs.GetAddressOf(), error_blob.GetAddressOf());
+        hr = mD3dCompile(vsSource.data(), vsSource.size(), nullptr, nullptr, nullptr, "VSMain", "vs_4_0",
+                         vs_compile_flags, 0, vs.GetAddressOf(), error_blob.GetAddressOf());
     }
 
     if (FAILED(hr)) {

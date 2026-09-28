@@ -530,6 +530,15 @@ static bool WriteMiniDump(PEXCEPTION_POINTERS ex, std::string& outPath) {
 }
 
 extern "C" LONG WINAPI seh_filter(PEXCEPTION_POINTERS ex) {
+    static volatile LONG crashThread = 0;
+    const LONG owner = InterlockedCompareExchange(&crashThread, (LONG)GetCurrentThreadId(), 0);
+    if (owner == (LONG)GetCurrentThreadId()) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (owner != 0) {
+        Sleep(INFINITE);
+    }
+
     char exceptionString[20];
     std::shared_ptr<CrashHandler> crashHandler = Context::GetRawInstance()->GetCrashHandler();
 
